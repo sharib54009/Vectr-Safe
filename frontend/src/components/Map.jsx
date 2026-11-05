@@ -1,27 +1,40 @@
-import { divIcon } from 'leaflet'
-import { MapContainer, Marker, Polyline, TileLayer, Tooltip } from 'react-leaflet'
+import { useEffect, useMemo } from 'react'
+import { divIcon, latLngBounds } from 'leaflet'
+import { MapContainer, Marker, Polyline, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
 
-// divIcon avoids Leaflet's default image-path issue in Vite builds.
-const vehicleIcon = divIcon({
-  className: 'saferoute-marker',
-  html: '<span class="saferoute-marker__vehicle" aria-hidden="true">●</span>',
-  iconSize: [28, 28], iconAnchor: [14, 14],
-})
-const destinationIcon = divIcon({
-  className: 'saferoute-marker',
-  html: '<span class="saferoute-marker__destination" aria-hidden="true">⌖</span>',
-  iconSize: [34, 34], iconAnchor: [17, 34],
-})
+const vehicleIcon = divIcon({ className: 'vectrsafe-marker', html: '<span class="vectrsafe-marker__vehicle" aria-hidden="true">●</span>', iconSize: [30, 30], iconAnchor: [15, 15] })
+const originIcon = divIcon({ className: 'vectrsafe-marker', html: '<span class="vectrsafe-marker__origin" aria-hidden="true">A</span>', iconSize: [30, 30], iconAnchor: [15, 15] })
+const destinationIcon = divIcon({ className: 'vectrsafe-marker', html: '<span class="vectrsafe-marker__destination" aria-hidden="true">B</span>', iconSize: [30, 30], iconAnchor: [15, 15] })
 
-function Map({ center, vehiclePosition, destination, route = [], actualRoute = [], zoom = 13, className = '' }) {
-  return <MapContainer center={center} zoom={zoom} scrollWheelZoom className={`saferoute-map ${className}`}>
-    <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-    {route.length > 1 && <Polyline positions={route} pathOptions={{ color: '#0284c7', weight: 5, opacity: 0.85 }} />}
-    {actualRoute.length > 1 && <Polyline positions={actualRoute} pathOptions={{ color: '#f97316', weight: 5, opacity: 0.9, dashArray: '8 8' }} />}
-    {vehiclePosition && <Marker position={vehiclePosition} icon={vehicleIcon}><Tooltip direction="top" offset={[0, -14]}>Current vehicle position</Tooltip></Marker>}
-    {destination?.position && <Marker position={destination.position} icon={destinationIcon}><Tooltip direction="top" offset={[0, -30]}>{destination.name || 'Destination'}</Tooltip></Marker>}
-  </MapContainer>
+function MapClickHandler({ onMapClick }) {
+  useMapEvents({ click: event => onMapClick?.({ latitude: event.latlng.lat, longitude: event.latlng.lng }) })
+  return null
 }
 
-export default Map
+function FitMap({ points }) {
+  const map = useMap()
+  useEffect(() => {
+    if (points.length > 1) map.fitBounds(latLngBounds(points), { padding: [28, 28], maxZoom: 15 })
+    else if (points.length === 1) map.setView(points[0], 14)
+  }, [map, points])
+  return null
+}
+
+export default function Map({ center, vehiclePosition, vehicleLabel = 'Current GPS location', origin, destination, route = [], actualRoute = [], zoom = 12, className = '', onMapClick }) {
+  const originPosition = useMemo(() => origin ? (Array.isArray(origin) ? origin : [origin.latitude, origin.longitude]) : null, [origin])
+  const points = useMemo(() => [originPosition, destination?.position, vehiclePosition, ...route, ...actualRoute]
+    .filter(Boolean)
+    .map(point => Array.isArray(point) ? point : [point.latitude, point.longitude]), [originPosition, destination?.position, vehiclePosition, route, actualRoute])
+
+  return <MapContainer center={center} zoom={zoom} scrollWheelZoom className={`vectrsafe-map ${className}`}>
+    <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+    <FitMap points={points} />
+    <MapClickHandler onMapClick={onMapClick} />
+    {route.length > 1 && <Polyline positions={route} pathOptions={{ color: '#167b78', weight: 5, opacity: 0.8 }} />}
+    {actualRoute.length > 1 && <Polyline positions={actualRoute} pathOptions={{ color: '#c48131', weight: 4, opacity: 0.9, dashArray: '6 8' }} />}
+    {originPosition && <Marker position={originPosition} icon={originIcon}><Tooltip direction="top">Origin</Tooltip></Marker>}
+    {vehiclePosition && <Marker position={vehiclePosition} icon={vehicleIcon}><Tooltip direction="top">{vehicleLabel}</Tooltip></Marker>}
+    {destination?.position && <Marker position={destination.position} icon={destinationIcon}><Tooltip direction="top">{destination.name || 'Destination'}</Tooltip></Marker>}
+  </MapContainer>
+}

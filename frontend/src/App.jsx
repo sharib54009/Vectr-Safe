@@ -1,90 +1,475 @@
-import { useEffect, useState } from 'react'
-import { io } from 'socket.io-client'
-import Map from './components/Map.jsx'
-import { vijayawadaDemoRoute } from './data/routes.js'
-import { API_BASE_URL, createRide, respondToCheckin, simulateSafetyIncident, triggerSos } from './services/api.js'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { acceptGuardianInvitation, createTrustedContact, getGuardianJourney, listGuardianJourneys, listTrustedContacts, removeTrustedContact, triggerSos } from './api/safety.js'
+import { getCurrentUser, logIn, logOut, signUp } from './api/auth.js'
+import { completeJourney, createJourney, getJourney, listJourneys, respondToCheckIn, submitLocation } from './api/journeys.js'
+import AuthPage from './pages/AuthPage.jsx'
+import HomePage from './pages/HomePage.jsx'
+import StartJourneyPage from './pages/StartJourneyPage.jsx'
+import LiveJourneyPage from './pages/LiveJourneyPage.jsx'
+import JourneyHistoryPage from './pages/JourneyHistoryPage.jsx'
+import TrustedContactsPage from './pages/TrustedContactsPage.jsx'
+import GuardianDashboardPage from './pages/GuardianDashboardPage.jsx'
+import GuardianJourneyPage from './pages/GuardianJourneyPage.jsx'
+import useJourneySocket from './hooks/useJourneySocket.js'
+import { journeyActive } from './lib/format.js'
 
-const initialUpdate = { risk_score: 15, risk_level: 'SAFE', status: 'active', signals: [{ signal: 'Journey appears normal.' }], high_risk_threshold: 75 }
+function currentPath() {
+  return window.location.pathname === '/' ? '/login' : window.location.pathname
+}
 
-function Header({ go }) { return <header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-4"><div><b className="text-xl">SafeRoute</b><p className="text-xs text-slate-500">Ride with confidence</p></div><button onClick={() => go('guardian')} className="rounded-lg px-3 py-2 text-sm font-semibold text-sky-700">Guardian</button></div></header> }
-function RideMap({ update }) { const actualRoute = update?.actual_route?.map(p => [p.latitude, p.longitude]) || []; const point = update?.current_location; return <Map {...vijayawadaDemoRoute} vehiclePosition={point ? [point.latitude, point.longitude] : vijayawadaDemoRoute.vehiclePosition} actualRoute={actualRoute} className="h-72 rounded-2xl border border-sky-100 sm:h-96" /> }
-function Status({ update }) { const signals = update?.signals?.map(s => s.signal) || ['Journey appears normal.']; const high = update?.risk_score >= update?.high_risk_threshold; return <div className="space-y-5"><section className={`rounded-2xl border p-5 ${high ? 'border-rose-200 bg-rose-50' : 'border-emerald-100 bg-emerald-50'}`}><div className="flex justify-between"><div><p className="text-sm font-semibold">Current risk score</p><p className="text-4xl font-black">{update?.risk_score ?? 15}<span className="text-lg">/100</span></p></div><span className={`h-fit rounded-full px-3 py-1 text-xs font-bold text-white ${high ? 'bg-rose-600' : 'bg-emerald-600'}`}>{update?.risk_level ?? 'SAFE'}</span></div><p className="mt-3 text-sm font-medium">{signals.at(-1)}</p></section><section className="rounded-2xl border bg-white p-5"><h2 className="font-bold">Detected safety signals</h2><ul className="mt-3 space-y-2 text-sm">{signals.map(s => <li key={s}>• {s}</li>)}</ul></section></div> }
-function CheckIn({ onRespond }) { return <section className="rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm"><p className="font-bold text-amber-900">Are you safe?</p><p className="mt-1 text-sm text-amber-800">Your guardian may be notified if you cannot respond.</p><div className="mt-3 grid gap-2 sm:grid-cols-3"><button onClick={() => onRespond('safe')} className="rounded-xl bg-emerald-600 p-3 font-bold text-white">I&apos;m Safe</button><button onClick={() => onRespond('help')} className="rounded-xl bg-rose-600 p-3 font-bold text-white">I Need Help</button><button onClick={() => onRespond('cannot_respond')} className="rounded-xl border border-amber-300 bg-white p-3 font-bold text-amber-900">I Can&apos;t Respond</button></div></section> }
-function SafetyAlert({ alert }) { if (!alert) return null; const location = alert.current_location; return <section className="mb-6 rounded-2xl border-2 border-rose-300 bg-rose-50 p-5 text-rose-950 shadow-sm"><p className="text-sm font-black uppercase tracking-wide">Possible safety incident detected</p><h2 className="mt-1 text-xl font-bold">{alert.rider_name} · {alert.risk_level} · {alert.risk_score}/100</h2><p className="mt-2 text-sm font-medium">{alert.message}</p><p className="mt-2 text-sm">Detected anomalies: {alert.signals?.join(', ') || 'None reported'}</p><p className="text-sm">Current location: {location ? `${Number(location.latitude).toFixed(5)}, ${Number(location.longitude).toFixed(5)}` : 'Unavailable'}</p><p className="text-sm">Timestamp: {alert.timestamp ? new Date(alert.timestamp).toLocaleString() : 'Unavailable'}</p><div className="mt-4 grid gap-2 sm:grid-cols-3"><button onClick={() => window.alert(`Call ${alert.rider_name}`)} className="rounded-xl border border-rose-300 bg-white p-3 font-bold">Call Rider</button><button onClick={() => window.alert('Live location is shown on the map.')} className="rounded-xl border border-rose-300 bg-white p-3 font-bold">Open Live Location</button><button onClick={() => window.alert('Prototype only: this does not contact 112.')} className="rounded-xl bg-rose-700 p-3 font-bold text-white">Emergency / 112</button></div></section> }
-function Home({ start, go }) { const [form, setForm] = useState({ name: '', start: '', destination: '', contact: '' }); const [error, setError] = useState(''); const input = (label, key) => <label className="block"><span className="mb-1 block text-sm font-semibold">{label}</span><input required value={form[key]} onChange={e => setForm({ ...form, [key]: e.target.value })} className="w-full rounded-xl border p-3" /></label>; const submit = async e => { e.preventDefault(); setError(''); try { await start(form) } catch (x) { setError(x.message || 'Unable to start your ride. Please try again.') } }; return <main className="min-h-screen bg-slate-50"><Header go={go}/><div className="mx-auto grid max-w-5xl gap-10 px-5 py-16 lg:grid-cols-2"><section><p className="font-bold text-sky-700">PROACTIVE RIDE SAFETY</p><h1 className="mt-4 text-5xl font-black">Safety that doesn&apos;t wait for an SOS.</h1></section><form onSubmit={submit} className="space-y-4 rounded-3xl border bg-white p-7 shadow"><h2 className="text-2xl font-bold">Start a safe ride</h2>{input('Your name', 'name')}{input('Starting location', 'start')}{input('Destination', 'destination')}{input('Trusted contact', 'contact')}{error && <p role="alert" className="text-sm text-rose-700">{error}</p>}<button className="w-full rounded-xl bg-sky-600 p-4 font-bold text-white">Start Safe Ride →</button></form></div></main> }
-function Active({ ride, update, simulate, running, go, checkIn, onCheckin, onSos }) { const high = update.risk_score >= update.high_risk_threshold; return <main className="min-h-screen bg-slate-50"><Header go={go}/><div className="mx-auto max-w-6xl px-5 py-7"><section className={`mb-6 flex items-center justify-between rounded-2xl p-5 text-white ${high ? 'bg-rose-700' : 'bg-slate-950'}`}><div><p className="text-sm font-bold">{high ? 'HIGH-RISK JOURNEY' : 'JOURNEY IN PROGRESS'}</p><h1 className="text-2xl font-bold">Heading to {ride.destination}</h1><p className="text-sm">Status: {update.status}</p></div><div className="flex gap-2"><button onClick={onSos} className="rounded-xl bg-rose-500 px-4 py-3 font-black text-white">SOS</button><button disabled={running} onClick={simulate} className="rounded-xl bg-white px-4 py-3 font-bold text-slate-900 disabled:opacity-60">{running ? 'Simulation running…' : 'Simulate Safety Incident'}</button></div></section>{checkIn && <div className="mb-6"><CheckIn onRespond={onCheckin}/></div>}<div className="grid gap-6 lg:grid-cols-[1.35fr_.85fr]"><section><RideMap update={update}/><p className="mt-3 rounded-xl border bg-white p-3 text-sm">Journey status: <b>{update.status}</b></p></section><Status update={update}/></div></div></main> }
-function Guardian({ ride, update, go, alert }) { const high = update.risk_score >= update.high_risk_threshold; const location = update.current_location; return <main className="min-h-screen bg-slate-50"><Header go={go}/><div className="mx-auto max-w-6xl px-5 py-7"><SafetyAlert alert={alert}/><section className={`mb-6 rounded-2xl p-5 ${high ? 'bg-rose-50 text-rose-800' : 'bg-sky-50 text-sky-800'}`}><p className="text-sm font-black">{high ? 'HIGH-RISK JOURNEY' : 'RIDING NOW'}</p><h1 className="text-2xl font-bold">{ride?.name || 'No active rider'}</h1></section><div className="grid gap-6 lg:grid-cols-[1.35fr_.85fr]"><section><RideMap update={update}/><div className="mt-4 rounded-2xl border bg-white p-4 text-sm"><p><b>Current location:</b> {location ? `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}` : 'Awaiting location'}</p><p><b>Expected route:</b> blue line</p><p><b>Actual route:</b> orange dashed line</p><p><b>Timestamp:</b> {update.timestamp ? new Date(update.timestamp).toLocaleString() : '—'}</p></div></section><div><Status update={update}/><section className="mt-6 rounded-2xl border bg-white p-5"><h2 className="font-bold">Emergency actions</h2><div className="mt-4 grid gap-3"><button className="rounded-xl border p-3 font-semibold">Check in with rider</button><button className="rounded-xl bg-rose-600 p-3 font-bold text-white">Emergency help</button></div></section></div></div></div></main> }
-function getStoredRide() { try { return JSON.parse(window.localStorage.getItem('saferoute.activeRide')) } catch { return null } }
+function useNavigation() {
+  const [path, setPath] = useState(currentPath)
+  useEffect(() => {
+    const onPopState = () => setPath(currentPath())
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+  const navigate = useCallback(nextPath => {
+    if (!nextPath.startsWith('/')) return
+    if (window.location.pathname !== nextPath) window.history.pushState({}, '', nextPath)
+    setPath(nextPath)
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  }, [])
+  return [path, navigate]
+}
+
+function normalizeJourney(data) {
+  const locations = data.locations || []
+  const lastLocation = locations.at(-1) || data.last_known_location || null
+  const riskReasons = (data.risk_reasons || data.risk?.reasons || []).filter(reason => reason.is_active !== false)
+  return {
+    ...data,
+    current_location: lastLocation,
+    last_known_location: lastLocation,
+    actual_route: locations,
+    risk: {
+      score: data.risk?.score ?? data.current_risk_score ?? 0,
+      state: data.risk?.state || data.current_risk_state || 'SAFE',
+      reasons: riskReasons.map(reason => ({ type: reason.type || reason.signal_type, severity: reason.severity, message: reason.message })),
+    },
+    eta: {
+      estimated_arrival: data.eta?.estimated_arrival ?? data.estimated_arrival_at,
+      remaining_distance_meters: data.eta?.remaining_distance_meters ?? data.remaining_distance_meters,
+    },
+  }
+}
+
+function appendLocation(previous, location) {
+  const history = previous?.actual_route || []
+  const alreadyPresent = location?.id && history.some(item => item.id === location.id)
+  return {
+    ...previous,
+    current_location: location,
+    last_known_location: location,
+    actual_route: alreadyPresent ? history : [...history, location].slice(-500),
+  }
+}
+
+function isSessionProblem(problem) {
+  return problem?.status === 401 || problem?.status === 403
+}
+
+function makeIdempotencyKey() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
 
 function App() {
-	const [view, setView] = useState('home')
-	const [ride, setRide] = useState(getStoredRide)
-	const [update, setUpdate] = useState(initialUpdate)
-	const [running, setRunning] = useState(false)
-	const [checkIn, setCheckIn] = useState(null)
-	const [alert, setAlert] = useState(null)
+  const [path, navigate] = useNavigation()
+  const [user, setUser] = useState(null)
+  const [authReady, setAuthReady] = useState(false)
+  const [authError, setAuthError] = useState('')
+  const [journeys, setJourneys] = useState([])
+  const [contacts, setContacts] = useState([])
+  const [guardianJourneys, setGuardianJourneys] = useState([])
+  const [journey, setJourney] = useState(null)
+  const [monitor, setMonitor] = useState(null)
+  const [checkIn, setCheckIn] = useState(null)
+  const [alert, setAlert] = useState(null)
+  const [guardianJourney, setGuardianJourney] = useState(null)
+  const [dashboardLoading, setDashboardLoading] = useState(false)
+  const [guardianLoading, setGuardianLoading] = useState(false)
+  const [journeyLoading, setJourneyLoading] = useState(false)
+  const [dashboardError, setDashboardError] = useState('')
+  const [guardianError, setGuardianError] = useState('')
+  const [journeyError, setJourneyError] = useState('')
+  const [pageNotice, setPageNotice] = useState('')
+  const [invitation, setInvitation] = useState(null)
+  const [locationSharing, setLocationSharing] = useState(false)
+  const [locationState, setLocationState] = useState('inactive')
+  const [busy, setBusy] = useState({ respond: false, sos: false, end: false })
+  const lastSentAt = useRef(0)
+  const pendingSosKey = useRef(null)
 
-	useEffect(() => {
-		const socket = io(API_BASE_URL, { transports: ['polling'] })
-		const rideId = () => ride?.id || getStoredRide()?.id
-		const matchesRide = data => data.ride_id === rideId()
-		const mergeRisk = data => {
-			if (!matchesRide(data)) return
-			setUpdate(previous => ({ ...previous, ...data, signals: data.signals.map(signal => typeof signal === 'string' ? { signal } : signal) }))
-		}
-		const receiveLocation = data => {
-			if (!matchesRide(data)) return
-			setUpdate(previous => ({ ...previous, current_location: data.location, actual_route: data.actual_route, timestamp: data.timestamp }))
-		}
-		const receiveAlert = data => mergeRisk(data)
-		const receiveSafetyAlert = data => {
-			if (!matchesRide(data)) return
-			setAlert(data)
-			setCheckIn(null)
-			setRunning(false)
-		}
-		const receiveCheckin = data => {
-			if (matchesRide(data)) setCheckIn(data)
-		}
-		const receiveStoredRide = event => {
-			if (!event.newValue) return
-			try { setRide(JSON.parse(event.newValue)) } catch { /* Ignore malformed local state. */ }
-		}
+  const riderJourneyId = path.match(/^\/app\/journey\/(\d+)$/)?.[1] || null
+  const guardianJourneyId = path.match(/^\/guardian\/journey\/(\d+)$/)?.[1] || null
+  const socketJourneyId = riderJourneyId && journeyActive(journey?.status)
+    ? Number(riderJourneyId)
+    : guardianJourneyId && guardianJourney && journeyActive(guardianJourney.status)
+      ? Number(guardianJourneyId)
+      : null
 
-		socket.on('location_update', receiveLocation)
-		socket.on('risk_update', mergeRisk)
-		socket.on('safety_alert', receiveSafetyAlert)
-		socket.on('check_in_requested', receiveCheckin)
-		window.addEventListener('storage', receiveStoredRide)
-		return () => {
-			socket.off('location_update', receiveLocation)
-			socket.off('risk_update', mergeRisk)
-			socket.off('safety_alert', receiveSafetyAlert)
-			socket.off('check_in_requested', receiveCheckin)
-			window.removeEventListener('storage', receiveStoredRide)
-			socket.disconnect()
-		}
-	}, [ride?.id])
+  const clearLocalSession = useCallback(() => {
+    setUser(null)
+    setJourneys([])
+    setContacts([])
+    setGuardianJourneys([])
+    setJourney(null)
+    setMonitor(null)
+    setCheckIn(null)
+    setAlert(null)
+    setGuardianJourney(null)
+    setLocationSharing(false)
+    setLocationState('inactive')
+    navigate('/login')
+  }, [navigate])
 
-	const start = async form => {
-		const created = await createRide({ riderName: form.name, origin: form.start, destination: form.destination, trustedContact: form.contact })
-		const nextRide = { ...form, id: created.ride_id }
-		setRide(nextRide)
-		window.localStorage.setItem('saferoute.activeRide', JSON.stringify(nextRide))
-		setUpdate({ ...initialUpdate, ...created })
-		setView('active')
-	}
-	const simulate = async () => {
-		try { setRunning(true); await simulateSafetyIncident(ride.id) } catch (x) { setRunning(false); window.alert(x.message) }
-	}
-	const respond = async response => {
-		try { await respondToCheckin(ride.id, response); setCheckIn(null) } catch (x) { window.alert(x.message) }
-	}
-	const onSos = async () => {
-		try { const created = await triggerSos(ride.id); setAlert(created) } catch (x) { window.alert(x.message) }
-	}
-	if (view === 'guardian') return <Guardian ride={ride} update={update} alert={alert} go={setView}/>
-	if (view === 'active' && ride) return <Active ride={ride} update={update} simulate={simulate} running={running} checkIn={checkIn} onCheckin={respond} onSos={onSos} go={setView}/>
-	return <Home start={start} go={setView}/>
+  const handleSessionProblem = useCallback(problem => {
+    if (!isSessionProblem(problem)) return false
+    clearLocalSession()
+    setAuthError('Your session expired. Please sign in again.')
+    return true
+  }, [clearLocalSession])
+
+  const refreshDashboard = useCallback(async () => {
+    if (!user) return
+    setDashboardLoading(true)
+    setDashboardError('')
+    try {
+      const [journeyList, contactList] = await Promise.all([listJourneys(), listTrustedContacts()])
+      setJourneys(journeyList)
+      setContacts(contactList)
+    } catch (problem) {
+      if (!handleSessionProblem(problem)) setDashboardError(problem.message)
+    } finally { setDashboardLoading(false) }
+  }, [user, handleSessionProblem])
+
+  const refreshGuardian = useCallback(async () => {
+    if (!user) return
+    setGuardianLoading(true)
+    setGuardianError('')
+    try { setGuardianJourneys(await listGuardianJourneys()) } catch (problem) {
+      if (!handleSessionProblem(problem)) setGuardianError(problem.message)
+    } finally { setGuardianLoading(false) }
+  }, [user, handleSessionProblem])
+
+  const refreshJourney = useCallback(async id => {
+    const detail = await getJourney(id)
+    setJourney(detail)
+    setMonitor(normalizeJourney(detail))
+    setCheckIn(detail.check_ins?.find(item => item.status === 'PENDING') || null)
+    setAlert(detail.alerts?.[0] || null)
+    setJourneyError('')
+    return detail
+  }, [])
+
+  const refreshGuardianJourney = useCallback(async id => {
+    const detail = await getGuardianJourney(id)
+    setGuardianJourney(detail)
+    setGuardianError('')
+    return detail
+  }, [])
+
+  useEffect(() => {
+    getCurrentUser().then(account => {
+      setUser(account)
+      if (path === '/' || path === '/login' || path === '/register') navigate('/app/home')
+    }).catch(problem => {
+      if (!isSessionProblem(problem)) setAuthError(problem.message)
+      setUser(null)
+    }).finally(() => setAuthReady(true))
+  }, []) // The session is checked once when the app starts.
+
+  useEffect(() => {
+    if (user) refreshDashboard()
+  }, [user, refreshDashboard])
+
+  useEffect(() => {
+    if (user && path.startsWith('/guardian')) refreshGuardian()
+  }, [user, path.startsWith('/guardian'), refreshGuardian])
+
+  useEffect(() => {
+    if (!user || !riderJourneyId) {
+      if (!riderJourneyId) {
+        setJourney(null)
+        setMonitor(null)
+        setCheckIn(null)
+        setAlert(null)
+        setLocationSharing(false)
+        setLocationState('inactive')
+      }
+      return undefined
+    }
+    let current = true
+    setJourneyLoading(true)
+    setJourneyError('')
+    getJourney(riderJourneyId).then(detail => {
+      if (!current) return
+      lastSentAt.current = 0
+      setJourney(detail)
+      setMonitor(normalizeJourney(detail))
+      setCheckIn(detail.check_ins?.find(item => item.status === 'PENDING') || null)
+      setAlert(detail.alerts?.[0] || null)
+      setLocationSharing(journeyActive(detail.status))
+      setLocationState(journeyActive(detail.status) ? 'requesting' : 'inactive')
+    }).catch(problem => {
+      if (!current) return
+      if (!handleSessionProblem(problem)) setJourneyError(problem.message)
+    }).finally(() => current && setJourneyLoading(false))
+    return () => { current = false }
+  }, [user, riderJourneyId, handleSessionProblem])
+
+  useEffect(() => {
+    if (!user || !guardianJourneyId) {
+      if (!guardianJourneyId) setGuardianJourney(null)
+      return undefined
+    }
+    let current = true
+    setGuardianLoading(true)
+    getGuardianJourney(guardianJourneyId).then(detail => current && setGuardianJourney(detail)).catch(problem => {
+      if (!current) return
+      if (!handleSessionProblem(problem)) setGuardianError(problem.message)
+    }).finally(() => current && setGuardianLoading(false))
+    return () => { current = false }
+  }, [user, guardianJourneyId, handleSessionProblem])
+
+  const applySocketEvent = useCallback(event => {
+    if (event.event === 'location_update') {
+      setMonitor(previous => appendLocation({ ...previous, eta: event.eta || previous?.eta }, event.location))
+      setJourney(previous => previous ? { ...previous, last_known_location: event.location } : previous)
+      setGuardianJourney(previous => previous ? { ...previous, last_known_location: event.location, last_location_at: event.location?.timestamp, locations: appendLocation({ actual_route: previous.locations || [] }, event.location).actual_route } : previous)
+    } else if (event.event === 'risk_update') {
+      setMonitor(previous => ({ ...previous, risk: event.risk }))
+      setJourney(previous => previous ? { ...previous, current_risk_state: event.risk.state, current_risk_score: event.risk.score, highest_risk_state: event.risk.state === 'HIGH' ? 'HIGH' : previous.highest_risk_state } : previous)
+      setGuardianJourney(previous => previous ? { ...previous, risk: event.risk, highest_risk_state: event.risk.state === 'HIGH' ? 'HIGH' : previous.highest_risk_state } : previous)
+      setGuardianJourneys(previous => previous.map(item => item.id === event.journey_id ? { ...item, risk: event.risk, highest_risk_state: event.risk.state === 'HIGH' ? 'HIGH' : item.highest_risk_state } : item))
+    } else if (event.event === 'check_in_requested' || event.event === 'check_in_updated') {
+      setCheckIn(event.check_in.status === 'PENDING' ? event.check_in : null)
+      setGuardianJourney(previous => previous ? { ...previous, check_ins: [event.check_in, ...(previous.check_ins || []).filter(item => item.id !== event.check_in.id)] } : previous)
+      if (event.event === 'check_in_requested') setPageNotice('A safety check-in is waiting for your response.')
+      if (event.check_in.status === 'RESPONDED_SAFE') setPageNotice('Your safe response was recorded.')
+    } else if (event.event === 'safety_alert') {
+      setAlert(event)
+      setCheckIn(null)
+      setJourney(previous => previous ? { ...previous, status: 'ESCALATED' } : previous)
+      setGuardianJourney(previous => previous ? { ...previous, status: 'ESCALATED', latest_alert: event, alerts: [event, ...(previous.alerts || []).filter(item => item.id !== event.id)] } : previous)
+      setGuardianJourneys(previous => previous.map(item => item.id === event.journey_id ? { ...item, status: 'ESCALATED', latest_alert: event } : item))
+    } else if (event.event === 'journey_status') {
+      setJourney(previous => previous ? { ...previous, status: event.status, ended_at: event.ended_at || previous.ended_at } : previous)
+      setGuardianJourney(previous => previous ? { ...previous, status: event.status, ended_at: event.ended_at || previous.ended_at } : previous)
+      setGuardianJourneys(previous => previous.map(item => item.id === event.journey_id ? { ...item, status: event.status } : item))
+      if (event.status === 'COMPLETED') setLocationSharing(false)
+    }
+  }, [])
+
+  const refreshSocketState = useCallback(() => {
+    if (riderJourneyId) refreshJourney(riderJourneyId).catch(problem => { if (!handleSessionProblem(problem)) setJourneyError(problem.message) })
+    if (guardianJourneyId) refreshGuardianJourney(guardianJourneyId).catch(problem => { if (!handleSessionProblem(problem)) setGuardianError(problem.message) })
+  }, [riderJourneyId, guardianJourneyId, refreshJourney, refreshGuardianJourney, handleSessionProblem])
+  const socketState = useJourneySocket(socketJourneyId, applySocketEvent, refreshSocketState)
+
+  useEffect(() => {
+    const monitoredJourneyId = journey?.id
+    const monitoredJourneyStatus = journey?.status
+    if (!locationSharing || !monitoredJourneyId || String(monitoredJourneyId) !== riderJourneyId || monitoredJourneyStatus === 'COMPLETED') return undefined
+    if (!navigator.geolocation) {
+      setLocationState('unsupported')
+      setLocationSharing(false)
+      return undefined
+    }
+    setLocationState('requesting')
+    const watchId = navigator.geolocation.watchPosition(position => {
+      setLocationState('active')
+      const now = Date.now()
+      if (now - lastSentAt.current < 15000) return
+      lastSentAt.current = now
+      const coords = position.coords
+      const sample = {
+        latitude: coords.latitude,
+        longitude: coords.longitude,
+        timestamp: new Date(position.timestamp).toISOString(),
+        accuracy_meters: coords.accuracy,
+        speed_meters_per_second: coords.speed,
+        heading_degrees: coords.heading,
+      }
+      submitLocation(monitoredJourneyId, sample).then(result => {
+        setMonitor(previous => ({ ...appendLocation({ ...previous, risk: result.risk, eta: result.eta }, result.location), risk: result.risk, eta: result.eta }))
+        if (result.check_in?.status === 'PENDING') setCheckIn(result.check_in)
+        setJourneys(previous => previous.map(item => item.id === journey.id ? { ...item, current_risk_state: result.risk.state, current_risk_score: result.risk.score } : item))
+      }).catch(problem => {
+        if (handleSessionProblem(problem)) return
+        setJourneyError(problem.message)
+      })
+    }, problem => {
+      setLocationState(problem.code === 1 ? 'denied' : 'error')
+      setLocationSharing(false)
+    }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 })
+    return () => navigator.geolocation.clearWatch(watchId)
+  }, [locationSharing, journey?.id, journey?.status, riderJourneyId, handleSessionProblem])
+
+  const submitAuth = async (mode, credentials) => {
+    const account = mode === 'register' ? await signUp(credentials) : await logIn(credentials)
+    setUser(account)
+    setAuthError('')
+    navigate('/app/home')
+  }
+
+  const retryAuth = async () => {
+    setAuthError('')
+    try {
+      const account = await getCurrentUser()
+      setUser(account)
+      navigate('/app/home')
+    } catch (problem) {
+      setAuthError(problem.message)
+    }
+  }
+
+  const startJourney = async form => {
+    const expected = form.expected_arrival_at ? new Date(form.expected_arrival_at).toISOString() : null
+    let created
+    try {
+      created = await createJourney({
+        origin: form.origin,
+        destination: form.destination,
+        origin_location: form.origin_location,
+        destination_location: form.destination_location,
+        planned_route: [],
+        expected_arrival_at: expected,
+      })
+    } catch (problem) {
+      handleSessionProblem(problem)
+      throw problem
+    }
+    setJourneys(previous => [created, ...previous])
+    setPageNotice('Journey started. Allow browser location to share GPS updates.')
+    navigate(`/app/journey/${created.id}`)
+  }
+
+  const addContact = async data => {
+    let contact
+    try { contact = await createTrustedContact(data) } catch (problem) {
+      handleSessionProblem(problem)
+      throw problem
+    }
+    setContacts(previous => [...previous, contact])
+    setInvitation(contact)
+    return contact
+  }
+
+  const deleteContact = async contactId => {
+    try {
+      await removeTrustedContact(contactId)
+      setContacts(previous => previous.filter(contact => contact.id !== contactId))
+    } catch (problem) {
+      if (!handleSessionProblem(problem)) setDashboardError(problem.message)
+    }
+  }
+
+  const respond = async value => {
+    if (!journey) return
+    setBusy(previous => ({ ...previous, respond: true }))
+    try {
+      const result = await respondToCheckIn(journey.id, value)
+      setCheckIn(null)
+      if (result.alert) setAlert(result.alert)
+      setPageNotice(value === 'SAFE' ? 'Your response was recorded by the server.' : 'Your request was recorded. Authorized guardians can see the alert in VectrSafe.')
+      setJourney(previous => previous ? { ...previous, status: result.alert ? 'ESCALATED' : previous.status } : previous)
+    } catch (problem) {
+      if (!handleSessionProblem(problem)) {
+        setJourneyError(problem.message)
+        try { await refreshJourney(journey.id) } catch { /* Preserve the server error on screen. */ }
+      }
+    } finally { setBusy(previous => ({ ...previous, respond: false })) }
+  }
+
+  const sendSOS = async () => {
+    if (!journey) return
+    setBusy(previous => ({ ...previous, sos: true }))
+    try {
+      const point = monitor?.current_location
+      if (!pendingSosKey.current || pendingSosKey.current.journeyId !== journey.id) {
+        pendingSosKey.current = { journeyId: journey.id, key: makeIdempotencyKey() }
+      }
+      const result = await triggerSos(journey.id, point ? { latitude: point.latitude, longitude: point.longitude } : {}, pendingSosKey.current.key)
+      pendingSosKey.current = null
+      setAlert(result.alert)
+      setJourney(previous => previous ? { ...previous, status: 'ESCALATED' } : previous)
+      setPageNotice('SOS recorded. Authorized guardians can view the alert in VectrSafe. External messages are not configured.')
+    } catch (problem) {
+      if (!handleSessionProblem(problem)) setJourneyError(problem.message)
+      throw problem
+    } finally { setBusy(previous => ({ ...previous, sos: false })) }
+  }
+
+  const endJourney = async () => {
+    if (!journey) return
+    setBusy(previous => ({ ...previous, end: true }))
+    try {
+      const completed = await completeJourney(journey.id)
+      setJourney(completed)
+      setMonitor(previous => previous ? { ...previous, status: 'COMPLETED' } : previous)
+      setLocationSharing(false)
+      setLocationState('inactive')
+      setJourneys(previous => previous.map(item => item.id === completed.id ? completed : item))
+      setPageNotice('Journey completed. GPS sharing has stopped.')
+    } catch (problem) {
+      if (!handleSessionProblem(problem)) setJourneyError(problem.message)
+    } finally { setBusy(previous => ({ ...previous, end: false })) }
+  }
+
+  const signOut = async () => {
+    try { await logOut() } catch { /* Clear local data if the server session has already ended. */ }
+    clearLocalSession()
+    setAuthError('')
+  }
+
+  const acceptInvitation = async code => {
+    try {
+      await acceptGuardianInvitation(code)
+      await refreshGuardian()
+    } catch (problem) {
+      handleSessionProblem(problem)
+      throw problem
+    }
+  }
+
+  const openJourney = id => navigate(`/app/journey/${id}`)
+  const openGuardianJourney = id => navigate(`/guardian/journey/${id}`)
+  const retryJourney = () => riderJourneyId && refreshJourney(riderJourneyId).catch(problem => { if (!handleSessionProblem(problem)) setJourneyError(problem.message) })
+  const retryGuardianJourney = () => guardianJourneyId && refreshGuardianJourney(guardianJourneyId).catch(problem => { if (!handleSessionProblem(problem)) setGuardianError(problem.message) })
+
+  const onRetryLocation = () => {
+    setJourneyError('')
+    setLocationState('requesting')
+    setLocationSharing(true)
+  }
+
+  const page = (() => {
+    if (!authReady) return <main className="grid min-h-screen place-items-center bg-[#f4f6f5] text-slate-700" role="status">Loading VectrSafe…</main>
+    if (!user) return <AuthPage key={path.startsWith('/register') ? 'register' : 'login'} initialMode={path === '/register' ? 'register' : 'login'} onModeChange={mode => navigate(mode === 'register' ? '/register' : '/login')} onSubmit={submitAuth} connectionError={authError} onRetry={retryAuth} />
+    if (path === '/login' || path === '/register' || path === '/') return null
+    if (path === '/app/journey/new') return <StartJourneyPage user={user} contacts={contacts} onNavigate={navigate} onLogout={signOut} onStart={startJourney} />
+    if (riderJourneyId) {
+      if (journeyLoading && !journey) return <main className="grid min-h-[70vh] place-items-center text-slate-700" role="status">Loading journey…</main>
+      if (!journey) return <main className="mx-auto mt-12 max-w-xl rounded-2xl border bg-white p-6"><h1 className="text-xl font-black">Journey unavailable</h1><p className="mt-2 text-sm text-slate-600">This journey could not be found or is not available to your account.</p><button onClick={() => navigate('/app/home')} className="mt-4 font-bold text-teal-900 underline">Return home</button></main>
+      return <LiveJourneyPage user={user} journey={{ ...journey, error: journeyError }} monitor={monitor || normalizeJourney(journey)} checkIn={checkIn} alert={alert} socketState={socketState} locationState={locationState} busy={busy} onNavigate={navigate} onLogout={signOut} onRespond={respond} onSos={sendSOS} onRetryLocation={onRetryLocation} onEnd={endJourney} onRefresh={retryJourney} />
+    }
+    if (path === '/app/journeys') return <JourneyHistoryPage user={user} journeys={journeys} loading={dashboardLoading} error={dashboardError} onNavigate={navigate} onLogout={signOut} onOpen={openJourney} onRetry={refreshDashboard} />
+    if (path === '/app/trusted-contacts') return <TrustedContactsPage user={user} contacts={contacts} loading={dashboardLoading} error={dashboardError} invitation={invitation} onNavigate={navigate} onLogout={signOut} onCreate={addContact} onRemove={deleteContact} onDismissInvitation={() => setInvitation(null)} onRetry={refreshDashboard} />
+    if (path === '/guardian/journeys' || path === '/guardian') return <GuardianDashboardPage user={user} journeys={guardianJourneys} loading={guardianLoading} error={guardianError} onNavigate={navigate} onLogout={signOut} onOpen={openGuardianJourney} onAccept={acceptInvitation} onRetry={refreshGuardian} />
+    if (guardianJourneyId) {
+      if (guardianLoading && !guardianJourney) return <main className="grid min-h-[70vh] place-items-center text-slate-700" role="status">Loading shared journey…</main>
+      if (!guardianJourney) return <main className="mx-auto mt-12 max-w-xl rounded-2xl border bg-white p-6"><h1 className="text-xl font-black">Shared journey unavailable</h1><p className="mt-2 text-sm text-slate-600">This journey is not available to your guardian account.</p><button onClick={() => navigate('/guardian/journeys')} className="mt-4 font-bold text-teal-900 underline">Return to guardian dashboard</button></main>
+      return <GuardianJourneyPage user={user} journey={guardianJourney} socketState={socketState} error={guardianError} onNavigate={navigate} onLogout={signOut} onRetry={retryGuardianJourney} />
+    }
+    if (path === '/app/home') return <HomePage user={user} journeys={journeys} contacts={contacts} loading={dashboardLoading} error={dashboardError} onNavigate={navigate} onLogout={signOut} onOpenJourney={openJourney} onRetry={refreshDashboard} />
+    return <main className="mx-auto mt-12 max-w-xl rounded-2xl border bg-white p-6"><h1 className="text-xl font-black">Page not found</h1><button onClick={() => navigate('/app/home')} className="mt-4 font-bold text-teal-900 underline">Go to home</button></main>
+  })()
+
+  return <>
+    {page}
+    {pageNotice && user && <div role="status" aria-live="polite" className="fixed bottom-3 left-1/2 z-[1000] w-[min(94vw,42rem)] -translate-x-1/2 rounded-xl bg-[#142a32] p-3 text-center text-sm text-white shadow-xl sm:bottom-5">{pageNotice}<button onClick={() => setPageNotice('')} className="ml-3 min-h-8 rounded px-2 font-bold underline">Dismiss</button></div>}
+  </>
 }
+
 export default App
