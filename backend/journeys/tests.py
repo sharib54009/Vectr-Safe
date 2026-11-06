@@ -52,7 +52,7 @@ class JourneyApiTests(TestCase):
         self.client.force_authenticate(self.other)
         endpoints = [
             ("journey-detail", "get", None),
-            ("journey-locations", "post", {"latitude": 16.5, "longitude": 80.64, "timestamp": timezone.now().isoformat()}),
+            ("journey-locations", "post", {"client_sample_id": "c6cf32f5-d7a0-4ab7-9dbe-5305c8833102", "latitude": 16.5, "longitude": 80.64, "timestamp": timezone.now().isoformat()}),
             ("journey-check-ins", "get", None),
             ("journey-check-in-response", "post", {"response": "SAFE"}),
             ("journey-sos", "post", {}),
@@ -72,6 +72,60 @@ class JourneyApiTests(TestCase):
         self.assertEqual(response.json()["journey_id"], self.journey.id)
         self.assertEqual(response.json()["risk"]["state"], "SAFE")
         self.assertIn("eta", response.json())
+        self.assertEqual(LocationSample.objects.filter(journey=self.journey).count(), 1)
+
+    def test_location_sample_idempotency_returns_existing_sample_on_retry(self):
+        sample_id = "c6cf32f5-d7a0-4ab7-9dbe-5305c8833102"
+        payload = {
+            "client_sample_id": sample_id, "latitude": 16.5, "longitude": 80.64,
+            "timestamp": timezone.now().isoformat(), "accuracy_meters": 8,
+        }
+        first = self.client.post(reverse("journey-locations", args=[self.journey.id]), payload, format="json")
+        second = self.client.post(reverse("journey-locations", args=[self.journey.id]), payload, format="json")
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.json()["already_processed"])
+        self.assertEqual(first.json()["location"]["id"], second.json()["location"]["id"])
+        self.assertEqual(LocationSample.objects.filter(journey=self.journey, client_sample_id=sample_id).count(), 1)
+
+    def test_invalid_location_sample_is_rejected(self):
+        response = self.client.post(reverse("journey-locations", args=[self.journey.id]), {
+            "client_sample_id": "c6cf32f5-d7a0-4ab7-9dbe-5305c8833102",
+            "latitude": 95, "longitude": 80.64, "timestamp": timezone.now().isoformat(),
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(LocationSample.objects.filter(journey=self.journey).count(), 0)
+
+    def test_queued_locations_are_processed_in_event_time_order(self):
+        first_at = self.journey.started_at + timedelta(seconds=1)
+        results = []
+        for index in range(3):
+            results.append(self.client.post(reverse("journey-locations", args=[self.journey.id]), {
+                "client_sample_id": f"c6cf32f5-d7a0-4ab7-9dbe-5305c883310{index}",
+                "latitude": 16.7, "longitude": 80.9 + index * 0.0001,
+                "timestamp": (first_at + timedelta(minutes=index)).isoformat(),
+            }, format="json"))
+        self.assertTrue(all(response.status_code == 201 for response in results))
+        samples = list(LocationSample.objects.filter(journey=self.journey).order_by("timestamp"))
+        self.assertEqual([sample.timestamp for sample in samples], sorted(sample.timestamp for sample in samples))
+        self.assertEqual(results[-1].json()["location"]["timestamp"], samples[-1].timestamp.isoformat().replace("+00:00", "Z"))
+        self.assertEqual(RiskEvent.objects.filter(journey=self.journey, signal_type="ROUTE_DEVIATION", is_active=True).count(), 1)
+
+    def test_completed_journey_accepts_only_precompletion_queued_sample(self):
+        ended_at = timezone.now() + timedelta(seconds=30)
+        self.journey.status = Journey.Status.COMPLETED
+        self.journey.ended_at = ended_at
+        self.journey.save(update_fields=["status", "ended_at"])
+        accepted = self.client.post(reverse("journey-locations", args=[self.journey.id]), {
+            "client_sample_id": "c6cf32f5-d7a0-4ab7-9dbe-5305c8833102",
+            "latitude": 16.5, "longitude": 80.64, "timestamp": (ended_at - timedelta(seconds=2)).isoformat(),
+        }, format="json")
+        rejected = self.client.post(reverse("journey-locations", args=[self.journey.id]), {
+            "client_sample_id": "c6cf32f5-d7a0-4ab7-9dbe-5305c8833103",
+            "latitude": 16.5, "longitude": 80.64, "timestamp": (ended_at + timedelta(seconds=2)).isoformat(),
+        }, format="json")
+        self.assertEqual(accepted.status_code, 201)
+        self.assertEqual(rejected.status_code, 409)
         self.assertEqual(LocationSample.objects.filter(journey=self.journey).count(), 1)
 
     def test_persistent_route_deviation_is_explainable_and_not_duplicated(self):
@@ -201,6 +255,44 @@ class JourneyApiTests(TestCase):
         self.assertEqual(incident.severity, "HIGH")
         self.assertEqual(incident.last_known_location["latitude"], 16.5)
         self.assertEqual(alert.delivery_status, SafetyAlert.DeliveryStatus.NOT_CONFIGURED)
+
+    def test_new_sos_key_reuses_existing_open_incident(self):
+        url = reverse("journey-sos", args=[self.journey.id])
+        first = self.client.post(url, {}, format="json", HTTP_IDEMPOTENCY_KEY="voice-request-1")
+        second = self.client.post(url, {}, format="json", HTTP_IDEMPOTENCY_KEY="manual-request-2")
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.json()["already_active"])
+        self.assertEqual(second.json()["incident_id"], first.json()["incident_id"])
+        self.assertEqual(SOS.objects.filter(journey=self.journey).count(), 1)
+        self.assertEqual(SafetyIncident.objects.filter(journey=self.journey, status=SafetyIncident.Status.OPEN).count(), 1)
+
+    def test_voice_sos_uses_existing_sos_incident_and_alert_flow(self):
+        response = self.client.post(
+            reverse("journey-sos", args=[self.journey.id]),
+            {"latitude": 16.5, "longitude": 80.64, "trigger_source": "VOICE"},
+            format="json", HTTP_IDEMPOTENCY_KEY="voice-activation-1",
+        )
+        self.assertEqual(response.status_code, 201)
+        sos = SOS.objects.get(journey=self.journey)
+        incident = SafetyIncident.objects.get(sos=sos)
+        alert = SafetyAlert.objects.get(incident=incident)
+        self.assertEqual(response.json()["incident_id"], incident.id)
+        self.assertEqual(response.json()["alert"]["id"], alert.id)
+        self.assertEqual(sos.trigger_source, SOS.TriggerSource.VOICE)
+        self.assertEqual(incident.incident_type, "VOICE_SOS")
+        self.assertEqual(alert.alert_type, "VOICE_SOS")
+
+    def test_sos_cannot_be_triggered_for_completed_journey(self):
+        self.journey.status = Journey.Status.COMPLETED
+        self.journey.ended_at = timezone.now()
+        self.journey.save(update_fields=["status", "ended_at"])
+        response = self.client.post(
+            reverse("journey-sos", args=[self.journey.id]), {}, format="json",
+            HTTP_IDEMPOTENCY_KEY="completed-journey-sos",
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(SOS.objects.filter(journey=self.journey).exists())
 
     def test_guardian_invitation_limits_journey_and_alert_access(self):
         contact = TrustedContact.objects.create(user=self.owner, name="Guardian", email=self.guardian.email)

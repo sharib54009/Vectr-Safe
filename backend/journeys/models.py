@@ -38,15 +38,24 @@ class Journey(models.Model):
 
 class LocationSample(models.Model):
     journey = models.ForeignKey(Journey, on_delete=models.CASCADE, related_name="locations")
+    client_sample_id = models.UUIDField(null=True, blank=True)
     latitude = models.FloatField()
     longitude = models.FloatField()
     timestamp = models.DateTimeField()
     accuracy_meters = models.FloatField(null=True, blank=True)
+    altitude_meters = models.FloatField(null=True, blank=True)
     speed_meters_per_second = models.FloatField(null=True, blank=True)
     heading_degrees = models.FloatField(null=True, blank=True)
 
     class Meta:
         ordering = ["timestamp", "id"]
         indexes = [models.Index(fields=["journey", "timestamp"], name="journey_location_time_idx")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["journey", "client_sample_id"],
+                condition=models.Q(client_sample_id__isnull=False),
+                name="unique_journey_client_sample",
+            ),
+        ]
 
 

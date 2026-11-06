@@ -104,15 +104,15 @@ def create_incident_for_sos(sos):
     """Create an incident and one not-configured external alert for an explicit SOS."""
     journey = Journey.objects.select_related("user").get(pk=sos.journey_id)
     location, risk = _journey_snapshot(journey)
-    if sos.latitude is not None and sos.longitude is not None:
-        location = {"latitude": sos.latitude, "longitude": sos.longitude, "timestamp": sos.created_at.isoformat()}
+    incident_type = "VOICE_SOS" if sos.trigger_source == SOS.TriggerSource.VOICE else "MANUAL_SOS"
+    reason = "The rider activated Voice SOS." if sos.trigger_source == SOS.TriggerSource.VOICE else "The rider manually requested emergency help."
     incident, _created = SafetyIncident.objects.get_or_create(
         sos=sos,
         defaults={
             "journey": journey,
-            "incident_type": "MANUAL_SOS",
+            "incident_type": incident_type,
             "severity": "HIGH",
-            "reason": "The rider manually requested emergency help.",
+            "reason": reason,
             "last_known_location": location,
             "risk_snapshot": risk,
         },
@@ -120,7 +120,7 @@ def create_incident_for_sos(sos):
     if journey.status not in (Journey.Status.COMPLETED, Journey.Status.CANCELLED):
         journey.status = Journey.Status.ESCALATED
         journey.save(update_fields=["status"])
-    return incident, _create_alert(incident, "MANUAL_SOS", incident.reason)
+    return incident, _create_alert(incident, incident_type, incident.reason)
 
 
 def create_incident_for_checkin_response(check_in, response):

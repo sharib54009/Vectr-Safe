@@ -11,11 +11,11 @@ from accounts.models import TrustedContact
 from risk import config as risk_config
 from risk.engine import estimate_eta, evaluate_movement, transition_risk_state
 from risk.models import RiskEvent
-from safety.models import SafetyAlert, SafetyCheckIn, SOS
+from safety.models import SafetyAlert, SafetyCheckIn, SafetyIncident, SOS
 from safety.serializers import SafetyAlertSerializer, SafetyCheckInSerializer, SafetyIncidentSerializer, SOSSerializer
 from safety.services import create_incident_for_checkin_response, create_incident_for_sos, escalate_checkin
 from .events import publish_journey_event
-from .models import Journey
+from .models import Journey, LocationSample
 from .serializers import JourneySerializer, LocationSampleSerializer
 
 
@@ -143,16 +143,37 @@ class JourneyDetailView(APIView):
 class JourneyLocationView(APIView):
     def post(self, request, journey_id):
         journey = owner_journey_or_404(request, journey_id)
-        if journey.status in (Journey.Status.COMPLETED, Journey.Status.CANCELLED):
-            return Response({"detail": "This journey has ended and no longer accepts location updates."}, status=status.HTTP_409_CONFLICT)
         serializer = LocationSampleSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        now = timezone.now()
+        sample_time = serializer.validated_data["timestamp"]
+        received_at = timezone.now()
+        if journey.status == Journey.Status.CANCELLED:
+            return Response({"detail": "This journey has been cancelled."}, status=status.HTTP_409_CONFLICT)
+        if sample_time > received_at + timedelta(minutes=5):
+            return Response({"detail": "The location timestamp is outside this journey's valid time range."}, status=status.HTTP_400_BAD_REQUEST)
+        if journey.status == Journey.Status.COMPLETED and (journey.ended_at is None or sample_time > journey.ended_at):
+            return Response({"detail": "This journey has ended and no longer accepts new location updates."}, status=status.HTTP_409_CONFLICT)
         with transaction.atomic():
-            location = serializer.save(journey=journey)
+            sample_id = serializer.validated_data.get("client_sample_id")
+            if sample_id:
+                location, created = LocationSample.objects.get_or_create(
+                    journey=journey,
+                    client_sample_id=sample_id,
+                    defaults={key: value for key, value in serializer.validated_data.items() if key != "client_sample_id"},
+                )
+                if not created:
+                    risk = {"score": journey.current_risk_score, "state": journey.current_risk_state, "reasons": []}
+                    eta = {"estimated_arrival": journey.estimated_arrival_at, "remaining_distance_meters": journey.remaining_distance_meters, "elapsed_seconds": max(0, int((sample_time - journey.started_at).total_seconds()))}
+                    return Response({
+                        "journey_id": journey.id, "location": LocationSampleSerializer(location).data,
+                        "risk": risk, "eta": eta, "check_in": None, "already_processed": True,
+                    }, status=status.HTTP_200_OK)
+            else:
+                location = serializer.save(journey=journey)
+            # Evaluate queued samples using the GPS event time, after earlier samples.
             locations = get_recent_locations(journey)
-            analysis = evaluate_movement(locations, journey.planned_route, now, journey.expected_arrival_at)
-            eta = estimate_eta(locations, journey.planned_route, now, journey.started_at)
+            analysis = evaluate_movement(locations, journey.planned_route, sample_time, journey.expected_arrival_at)
+            eta = estimate_eta(locations, journey.planned_route, sample_time, journey.started_at)
             old_state = journey.current_risk_state
             old_status = journey.status
             risk_state, lower_count = transition_risk_state(old_state, analysis["state"], journey.lower_risk_sample_count)
@@ -164,7 +185,7 @@ class JourneyLocationView(APIView):
             journey.lower_risk_sample_count = lower_count
             journey.estimated_arrival_at = eta["estimated_arrival"]
             journey.remaining_distance_meters = eta["remaining_distance_meters"]
-            if risk_state == Journey.RiskState.HIGH:
+            if risk_state == Journey.RiskState.HIGH and journey.status != Journey.Status.COMPLETED:
                 journey.status = Journey.Status.HIGH_RISK
             elif journey.status in (Journey.Status.ACTIVE, Journey.Status.HIGH_RISK):
                 journey.status = Journey.Status.ACTIVE
@@ -173,17 +194,17 @@ class JourneyLocationView(APIView):
                 "remaining_distance_meters", "status",
                 "highest_risk_state",
             ])
-            update_risk_events(journey, analysis["reasons"], now)
+            update_risk_events(journey, analysis["reasons"], sample_time)
 
             check_in = None
-            if risk_state == Journey.RiskState.HIGH:
+            if risk_state == Journey.RiskState.HIGH and journey.status != Journey.Status.COMPLETED:
                 pending = None
                 if old_state != Journey.RiskState.HIGH:
                     pending, created = SafetyCheckIn.objects.get_or_create(
                         journey=journey,
                         status=SafetyCheckIn.Status.PENDING,
                         defaults={
-                            "deadline": now + timedelta(seconds=risk_config.SAFETY_CHECKIN_TIMEOUT_SECONDS),
+                            "deadline": received_at + timedelta(seconds=risk_config.SAFETY_CHECKIN_TIMEOUT_SECONDS),
                             "reason": " ".join(reason["message"] for reason in analysis["reasons"]),
                         },
                     )
@@ -212,6 +233,7 @@ class JourneyLocationView(APIView):
                 "eta": eta_payload,
                 "elapsed_seconds": eta["elapsed_seconds"],
                 "check_in": check_in_payload,
+                "already_processed": False,
             }
             transaction.on_commit(lambda: publish_journey_event(journey.id, "location_update", {
                 "journey_id": journey.id, "location": location_payload, "eta": eta_payload,
@@ -240,11 +262,11 @@ class JourneyCompleteView(APIView):
                 journey=journey,
                 status=SafetyCheckIn.Status.PENDING,
             ).update(status=SafetyCheckIn.Status.CANCELLED, updated_at=now)
-            publish_journey_event(journey.id, "journey_status", {
+            transaction.on_commit(lambda: publish_journey_event(journey.id, "journey_status", {
                 "journey_id": journey.id,
                 "status": journey.status,
                 "ended_at": journey.ended_at.isoformat(),
-            })
+            }))
         return Response(JourneySerializer(journey).data)
 
 
@@ -298,10 +320,7 @@ class CheckInResponseView(APIView):
 
 class SOSView(APIView):
     def post(self, request, journey_id):
-        journey = owner_journey_or_404(request, journey_id)
-        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
-        if not idempotency_key or len(idempotency_key) > 64:
-            return Response({"detail": "A unique Idempotency-Key header is required for SOS."}, status=status.HTTP_400_BAD_REQUEST)
+        owner_journey_or_404(request, journey_id)
         try:
             latitude = float(request.data["latitude"]) if request.data.get("latitude") is not None else None
             longitude = float(request.data["longitude"]) if request.data.get("longitude") is not None else None
@@ -310,16 +329,43 @@ class SOSView(APIView):
         if (latitude is None) != (longitude is None) or (latitude is not None and not (-90 <= latitude <= 90 and -180 <= longitude <= 180)):
             return Response({"detail": "Provide both valid latitude and longitude values."}, status=status.HTTP_400_BAD_REQUEST)
 
-        sos, created = SOS.objects.get_or_create(
-            journey=journey,
-            idempotency_key=idempotency_key,
-            defaults={"latitude": latitude, "longitude": longitude},
-        )
-        incident, alert = create_incident_for_sos(sos)
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        if not idempotency_key or len(idempotency_key) > 64:
+            return Response({"detail": "A unique Idempotency-Key header is required for SOS."}, status=status.HTTP_400_BAD_REQUEST)
+        trigger_source = str(request.data.get("trigger_source", SOS.TriggerSource.MANUAL)).upper()
+        if trigger_source not in SOS.TriggerSource.values:
+            return Response({"detail": "trigger_source must be MANUAL or VOICE."}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            journey = get_object_or_404(
+                Journey.objects.select_for_update().filter(user=request.user), pk=journey_id,
+            )
+            if journey.status in (Journey.Status.COMPLETED, Journey.Status.CANCELLED):
+                return Response({"detail": "SOS is unavailable because this journey has ended."}, status=status.HTTP_409_CONFLICT)
+
+            active_incident = SafetyIncident.objects.filter(
+                journey=journey, status=SafetyIncident.Status.OPEN,
+            ).order_by("created_at", "id").first()
+            if active_incident is not None:
+                alert = SafetyAlert.objects.select_related("incident").get(incident=active_incident)
+                return Response({
+                    "sos": SOSSerializer(active_incident.sos).data if active_incident.sos_id else None,
+                    "incident_id": active_incident.id,
+                    "alert": SafetyAlertSerializer(alert).data,
+                    "already_active": True,
+                }, status=status.HTTP_200_OK)
+
+            sos, created = SOS.objects.get_or_create(
+                journey=journey,
+                idempotency_key=idempotency_key,
+                defaults={"latitude": latitude, "longitude": longitude, "trigger_source": trigger_source},
+            )
+            incident, alert = create_incident_for_sos(sos)
         return Response({
             "sos": SOSSerializer(sos).data,
             "incident_id": incident.id,
             "alert": SafetyAlertSerializer(alert).data,
+            "already_active": not created,
         }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 

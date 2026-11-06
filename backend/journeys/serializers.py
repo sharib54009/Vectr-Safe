@@ -4,15 +4,17 @@ from .models import Journey, LocationSample
 
 
 class LocationSampleSerializer(serializers.ModelSerializer):
+    client_sample_id = serializers.UUIDField(required=False, allow_null=True)
     latitude = serializers.FloatField(min_value=-90, max_value=90)
     longitude = serializers.FloatField(min_value=-180, max_value=180)
     accuracy_meters = serializers.FloatField(min_value=0, required=False, allow_null=True)
     speed_meters_per_second = serializers.FloatField(min_value=0, required=False, allow_null=True)
     heading_degrees = serializers.FloatField(min_value=0, max_value=360, required=False, allow_null=True)
+    altitude_meters = serializers.FloatField(required=False, allow_null=True)
 
     class Meta:
         model = LocationSample
-        fields = ["id", "latitude", "longitude", "timestamp", "accuracy_meters", "speed_meters_per_second", "heading_degrees"]
+        fields = ["id", "client_sample_id", "latitude", "longitude", "timestamp", "accuracy_meters", "altitude_meters", "speed_meters_per_second", "heading_degrees"]
         read_only_fields = ["id"]
 
 

@@ -1,8 +1,9 @@
 import { useState } from 'react'
 
-export default function SOSButton({ onSend, busy = false, compact = false }) {
+export default function SOSButton({ onSend, busy = false, compact = false, activated = false }) {
   const [confirming, setConfirming] = useState(false)
   const [error, setError] = useState('')
+  if (activated) return <button type="button" disabled aria-live="polite" className={`min-h-12 rounded-xl bg-rose-950 px-5 py-3 font-black text-white ${compact ? 'w-full sm:w-auto' : 'w-full'}`}>SOS ACTIVATED</button>
   return <div className={compact ? '' : 'space-y-2'}>
     {!confirming ? <button type="button" onClick={() => { setError(''); setConfirming(true) }} aria-haspopup="dialog" className={`min-h-12 rounded-xl bg-rose-700 px-5 py-3 font-black text-white hover:bg-rose-800 focus-visible:outline focus-visible:outline-4 focus-visible:outline-offset-2 focus-visible:outline-rose-700 ${compact ? 'w-full sm:w-auto' : 'w-full'}`}>
       SOS · Request help

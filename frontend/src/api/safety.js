@@ -8,6 +8,6 @@ export const listGuardianJourneys = () => request('/api/guardian/journeys/')
 export const getGuardianJourney = journeyId => request(`/api/guardian/journeys/${journeyId}/`)
 export const listAlerts = () => request('/api/safety/alerts/')
 
-export function triggerSos(journeyId, location, idempotencyKey) {
-  return post(`/api/journeys/${journeyId}/sos/`, location || {}, { 'Idempotency-Key': idempotencyKey })
+export function triggerSos(journeyId, location, idempotencyKey, triggerSource = 'MANUAL') {
+  return post(`/api/journeys/${journeyId}/sos/`, { ...(location || {}), trigger_source: triggerSource }, { 'Idempotency-Key': idempotencyKey })
 }

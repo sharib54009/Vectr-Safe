@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { acceptGuardianInvitation, createTrustedContact, getGuardianJourney, listGuardianJourneys, listTrustedContacts, removeTrustedContact, triggerSos } from './api/safety.js'
 import { getCurrentUser, logIn, logOut, signUp } from './api/auth.js'
-import { completeJourney, createJourney, getJourney, listJourneys, respondToCheckIn, submitLocation } from './api/journeys.js'
+import { completeJourney, createJourney, getJourney, listJourneys, respondToCheckIn } from './api/journeys.js'
 import AuthPage from './pages/AuthPage.jsx'
 import HomePage from './pages/HomePage.jsx'
 import StartJourneyPage from './pages/StartJourneyPage.jsx'
@@ -12,6 +12,8 @@ import GuardianDashboardPage from './pages/GuardianDashboardPage.jsx'
 import GuardianJourneyPage from './pages/GuardianJourneyPage.jsx'
 import useJourneySocket from './hooks/useJourneySocket.js'
 import { journeyActive } from './lib/format.js'
+import { getJourneySnapshot, getQueuedLocations, queueLocationSample, removeJourneyLocations, saveJourneySnapshot } from './gps/locationQueue.js'
+import { syncQueuedLocations } from './gps/locationSync.js'
 
 function currentPath() {
   return window.location.pathname === '/' ? '/login' : window.location.pathname
@@ -56,7 +58,8 @@ function normalizeJourney(data) {
 
 function appendLocation(previous, location) {
   const history = previous?.actual_route || []
-  const alreadyPresent = location?.id && history.some(item => item.id === location.id)
+  const alreadyPresent = history.some(item => (location?.id && item.id === location.id)
+    || (location?.client_sample_id && item.client_sample_id === location.client_sample_id))
   return {
     ...previous,
     current_location: location,
@@ -70,7 +73,14 @@ function isSessionProblem(problem) {
 }
 
 function makeIdempotencyKey() {
-  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
+  const bytes = new Uint8Array(16)
+  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes)
+  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256)
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
 function App() {
@@ -85,6 +95,7 @@ function App() {
   const [monitor, setMonitor] = useState(null)
   const [checkIn, setCheckIn] = useState(null)
   const [alert, setAlert] = useState(null)
+  const [emergency, setEmergency] = useState(null)
   const [guardianJourney, setGuardianJourney] = useState(null)
   const [dashboardLoading, setDashboardLoading] = useState(false)
   const [guardianLoading, setGuardianLoading] = useState(false)
@@ -96,9 +107,13 @@ function App() {
   const [invitation, setInvitation] = useState(null)
   const [locationSharing, setLocationSharing] = useState(false)
   const [locationState, setLocationState] = useState('inactive')
+  const [gpsSync, setGpsSync] = useState({ state: navigator.onLine ? 'live' : 'offline', queued: 0 })
   const [busy, setBusy] = useState({ respond: false, sos: false, end: false })
   const lastSentAt = useRef(0)
   const pendingSosKey = useRef(null)
+  const emergencyRef = useRef(null)
+  const sosRequestRef = useRef(null)
+  const syncRetryTimer = useRef(null)
 
   const riderJourneyId = path.match(/^\/app\/journey\/(\d+)$/)?.[1] || null
   const guardianJourneyId = path.match(/^\/guardian\/journey\/(\d+)$/)?.[1] || null
@@ -117,6 +132,9 @@ function App() {
     setMonitor(null)
     setCheckIn(null)
     setAlert(null)
+    emergencyRef.current = null
+    pendingSosKey.current = null
+    setEmergency(null)
     setGuardianJourney(null)
     setLocationSharing(false)
     setLocationState('inactive')
@@ -129,6 +147,32 @@ function App() {
     setAuthError('Your session expired. Please sign in again.')
     return true
   }, [clearLocalSession])
+
+  const syncJourneyLocations = useCallback(async (id, { force = false } = {}) => {
+    if (!id || (!navigator.onLine && !force)) {
+      setGpsSync(previous => ({ ...previous, state: 'offline' }))
+      return
+    }
+    setGpsSync(previous => ({ ...previous, state: previous.queued ? 'syncing' : 'live' }))
+    try {
+      const result = await syncQueuedLocations(id, response => {
+        setMonitor(previous => ({ ...appendLocation({ ...previous, risk: response.risk, eta: response.eta }, response.location), risk: response.risk, eta: response.eta }))
+        if (response.check_in?.status === 'PENDING') setCheckIn(response.check_in)
+        setJourneys(previous => previous.map(item => item.id === Number(id) ? { ...item, current_risk_state: response.risk.state, current_risk_score: response.risk.score } : item))
+      })
+      const remaining = await getQueuedLocations(id)
+      setGpsSync({ state: result.error ? 'problem' : remaining.length ? (navigator.onLine ? 'syncing' : 'offline') : 'synced', queued: remaining.length })
+      if (result.error && navigator.onLine && !syncRetryTimer.current) {
+        syncRetryTimer.current = window.setTimeout(() => {
+          syncRetryTimer.current = null
+          syncJourneyLocations(id)
+        }, result.retryAfter || 15_000)
+      }
+      if (result.error && isSessionProblem(result.error)) handleSessionProblem(result.error)
+    } catch {
+      setGpsSync(previous => ({ ...previous, state: navigator.onLine ? 'problem' : 'offline' }))
+    }
+  }, [handleSessionProblem])
 
   const refreshDashboard = useCallback(async () => {
     if (!user) return
@@ -200,23 +244,56 @@ function App() {
       return undefined
     }
     let current = true
+    setJourney(null)
+    setMonitor(null)
+    emergencyRef.current = null
+    pendingSosKey.current = null
+    setEmergency(null)
     setJourneyLoading(true)
     setJourneyError('')
     getJourney(riderJourneyId).then(detail => {
       if (!current) return
+      if (emergencyRef.current && String(emergencyRef.current.journeyId) !== String(detail.id)) {
+        emergencyRef.current = null
+        pendingSosKey.current = null
+        setEmergency(null)
+      }
       lastSentAt.current = 0
       setJourney(detail)
       setMonitor(normalizeJourney(detail))
+      saveJourneySnapshot({
+        journey_id: Number(detail.id), owner_id: String(user.id), id: detail.id, origin: detail.origin,
+        destination: detail.destination, status: detail.status, started_at: detail.started_at,
+        ended_at: detail.ended_at, planned_route: [], origin_location: detail.origin_location,
+        destination_location: detail.destination_location, current_risk_state: detail.current_risk_state,
+        highest_risk_state: detail.highest_risk_state, current_risk_score: detail.current_risk_score,
+        last_known_location: detail.last_known_location || detail.locations?.at(-1) || null,
+      }).catch(() => {})
       setCheckIn(detail.check_ins?.find(item => item.status === 'PENDING') || null)
       setAlert(detail.alerts?.[0] || null)
       setLocationSharing(journeyActive(detail.status))
       setLocationState(journeyActive(detail.status) ? 'requesting' : 'inactive')
     }).catch(problem => {
       if (!current) return
-      if (!handleSessionProblem(problem)) setJourneyError(problem.message)
+      if (isSessionProblem(problem)) {
+        handleSessionProblem(problem)
+        return
+      }
+      if (problem.status === 0) {
+        Promise.all([getJourneySnapshot(riderJourneyId), getQueuedLocations(riderJourneyId)]).then(([snapshot, queued]) => {
+          if (!current || !snapshot || snapshot.owner_id !== String(user.id)) throw problem
+          const offlineJourney = { ...snapshot, locations: queued, last_known_location: queued.at(-1) || null }
+          setJourney(offlineJourney)
+          setMonitor(normalizeJourney(offlineJourney))
+          setLocationSharing(journeyActive(snapshot.status))
+          setLocationState(journeyActive(snapshot.status) ? 'requesting' : 'inactive')
+          setGpsSync({ state: navigator.onLine ? (queued.length ? 'syncing' : 'problem') : 'offline', queued: queued.length })
+          if (queued.length && navigator.onLine) syncJourneyLocations(riderJourneyId)
+        }).catch(() => { if (current) setJourneyError(problem.message) })
+      } else setJourneyError(problem.message)
     }).finally(() => current && setJourneyLoading(false))
     return () => { current = false }
-  }, [user, riderJourneyId, handleSessionProblem])
+  }, [user, riderJourneyId, handleSessionProblem, syncJourneyLocations])
 
   useEffect(() => {
     if (!user || !guardianJourneyId) {
@@ -268,6 +345,39 @@ function App() {
   const socketState = useJourneySocket(socketJourneyId, applySocketEvent, refreshSocketState)
 
   useEffect(() => {
+    const id = journey?.id
+    if (!user || !id || !riderJourneyId || String(id) !== riderJourneyId) return undefined
+    let current = true
+    const restore = async () => {
+      if (journey.status === 'CANCELLED') {
+        await removeJourneyLocations(id)
+        if (current) setGpsSync({ state: 'inactive', queued: 0 })
+        return
+      }
+      try {
+        const queued = await getQueuedLocations(id)
+        if (!current) return
+        setGpsSync({ state: !navigator.onLine ? 'offline' : queued.length ? 'syncing' : 'synced', queued: queued.length })
+        if (queued.length) syncJourneyLocations(id)
+      } catch {
+        if (current) setGpsSync({ state: 'problem', queued: 0 })
+      }
+    }
+    restore()
+    const onOnline = () => syncJourneyLocations(id, { force: true })
+    const onOffline = () => setGpsSync(previous => ({ ...previous, state: 'offline' }))
+    window.addEventListener('online', onOnline)
+    window.addEventListener('offline', onOffline)
+    return () => {
+      current = false
+      window.removeEventListener('online', onOnline)
+      window.removeEventListener('offline', onOffline)
+      if (syncRetryTimer.current) window.clearTimeout(syncRetryTimer.current)
+      syncRetryTimer.current = null
+    }
+  }, [user, journey?.id, journey?.status, riderJourneyId, syncJourneyLocations])
+
+  useEffect(() => {
     const monitoredJourneyId = journey?.id
     const monitoredJourneyStatus = journey?.status
     if (!locationSharing || !monitoredJourneyId || String(monitoredJourneyId) !== riderJourneyId || monitoredJourneyStatus === 'COMPLETED') return undefined
@@ -284,27 +394,32 @@ function App() {
       lastSentAt.current = now
       const coords = position.coords
       const sample = {
+        journey_id: Number(monitoredJourneyId),
+        client_sample_id: makeIdempotencyKey(),
         latitude: coords.latitude,
         longitude: coords.longitude,
         timestamp: new Date(position.timestamp).toISOString(),
         accuracy_meters: coords.accuracy,
+        altitude_meters: coords.altitude,
         speed_meters_per_second: coords.speed,
         heading_degrees: coords.heading,
       }
-      submitLocation(monitoredJourneyId, sample).then(result => {
-        setMonitor(previous => ({ ...appendLocation({ ...previous, risk: result.risk, eta: result.eta }, result.location), risk: result.risk, eta: result.eta }))
-        if (result.check_in?.status === 'PENDING') setCheckIn(result.check_in)
-        setJourneys(previous => previous.map(item => item.id === journey.id ? { ...item, current_risk_state: result.risk.state, current_risk_score: result.risk.score } : item))
-      }).catch(problem => {
-        if (handleSessionProblem(problem)) return
-        setJourneyError(problem.message)
+      const localLocation = { ...sample, id: `local-${sample.client_sample_id}` }
+      setMonitor(previous => appendLocation(previous, localLocation))
+      queueLocationSample(sample).then(async () => {
+        const queued = await getQueuedLocations(monitoredJourneyId)
+        setGpsSync(previous => ({ ...previous, queued: queued.length, state: navigator.onLine ? 'syncing' : 'offline' }))
+        syncJourneyLocations(monitoredJourneyId)
+      }).catch(() => {
+        setGpsSync(previous => ({ ...previous, state: 'problem' }))
+        setJourneyError('Location could not be saved on this device. Check browser storage access.')
       })
     }, problem => {
       setLocationState(problem.code === 1 ? 'denied' : 'error')
       setLocationSharing(false)
     }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 })
     return () => navigator.geolocation.clearWatch(watchId)
-  }, [locationSharing, journey?.id, journey?.status, riderJourneyId, handleSessionProblem])
+  }, [locationSharing, journey?.id, journey?.status, riderJourneyId, syncJourneyLocations])
 
   const submitAuth = async (mode, credentials) => {
     const account = mode === 'register' ? await signUp(credentials) : await logIn(credentials)
@@ -382,24 +497,57 @@ function App() {
     } finally { setBusy(previous => ({ ...previous, respond: false })) }
   }
 
-  const sendSOS = async () => {
-    if (!journey) return
-    setBusy(previous => ({ ...previous, sos: true }))
-    try {
-      const point = monitor?.current_location
-      if (!pendingSosKey.current || pendingSosKey.current.journeyId !== journey.id) {
-        pendingSosKey.current = { journeyId: journey.id, key: makeIdempotencyKey() }
+  const sendSOS = useCallback((triggerSource = 'MANUAL') => {
+    if (!journey) return Promise.resolve(null)
+    if (emergencyRef.current?.state === 'recorded') return Promise.resolve(emergencyRef.current.result)
+    if (sosRequestRef.current) return sosRequestRef.current
+
+    const source = emergencyRef.current?.source || triggerSource
+    if (!pendingSosKey.current || pendingSosKey.current.journeyId !== journey.id) {
+      pendingSosKey.current = { journeyId: journey.id, key: makeIdempotencyKey() }
+    }
+    const setEmergencyState = next => {
+      emergencyRef.current = next
+      setEmergency(next)
+    }
+    setEmergencyState({ state: 'sending', source, journeyId: journey.id })
+    const request = (async () => {
+      setBusy(previous => ({ ...previous, sos: true }))
+      try {
+        const point = monitor?.current_location
+        const result = await triggerSos(journey.id, point ? { latitude: point.latitude, longitude: point.longitude } : {}, pendingSosKey.current.key, source)
+        pendingSosKey.current = null
+        setAlert(result.alert)
+        setJourney(previous => previous ? { ...previous, status: 'ESCALATED' } : previous)
+        setEmergencyState({ state: 'recorded', source, journeyId: journey.id, result })
+        return result
+      } catch (problem) {
+        if (isSessionProblem(problem)) handleSessionProblem(problem)
+        const canRetry = problem.status === 0 || problem.status >= 500
+        setEmergencyState({
+          state: canRetry ? 'local_pending' : 'failed',
+          source,
+          journeyId: journey.id,
+          message: canRetry ? '' : 'Check the journey and session, then retry if help is still needed.',
+        })
+        return null
+      } finally {
+        setBusy(previous => ({ ...previous, sos: false }))
+        sosRequestRef.current = null
       }
-      const result = await triggerSos(journey.id, point ? { latitude: point.latitude, longitude: point.longitude } : {}, pendingSosKey.current.key)
-      pendingSosKey.current = null
-      setAlert(result.alert)
-      setJourney(previous => previous ? { ...previous, status: 'ESCALATED' } : previous)
-      setPageNotice('SOS recorded. Authorized guardians can view the alert in VectrSafe. External messages are not configured.')
-    } catch (problem) {
-      if (!handleSessionProblem(problem)) setJourneyError(problem.message)
-      throw problem
-    } finally { setBusy(previous => ({ ...previous, sos: false })) }
-  }
+    })()
+    sosRequestRef.current = request
+    return request
+  }, [journey, monitor, handleSessionProblem])
+
+  useEffect(() => {
+    if (!journey?.id || emergency?.state !== 'local_pending') return undefined
+    const retryWhenOnline = () => {
+      if (navigator.onLine) sendSOS(emergency.source)
+    }
+    window.addEventListener('online', retryWhenOnline)
+    return () => window.removeEventListener('online', retryWhenOnline)
+  }, [journey?.id, emergency?.state, emergency?.source, sendSOS])
 
   const endJourney = async () => {
     if (!journey) return
@@ -452,7 +600,7 @@ function App() {
     if (riderJourneyId) {
       if (journeyLoading && !journey) return <main className="grid min-h-[70vh] place-items-center text-slate-700" role="status">Loading journey…</main>
       if (!journey) return <main className="mx-auto mt-12 max-w-xl rounded-2xl border bg-white p-6"><h1 className="text-xl font-black">Journey unavailable</h1><p className="mt-2 text-sm text-slate-600">This journey could not be found or is not available to your account.</p><button onClick={() => navigate('/app/home')} className="mt-4 font-bold text-teal-900 underline">Return home</button></main>
-      return <LiveJourneyPage user={user} journey={{ ...journey, error: journeyError }} monitor={monitor || normalizeJourney(journey)} checkIn={checkIn} alert={alert} socketState={socketState} locationState={locationState} busy={busy} onNavigate={navigate} onLogout={signOut} onRespond={respond} onSos={sendSOS} onRetryLocation={onRetryLocation} onEnd={endJourney} onRefresh={retryJourney} />
+      return <LiveJourneyPage user={user} journey={{ ...journey, error: journeyError }} monitor={monitor || normalizeJourney(journey)} checkIn={checkIn} alert={alert} emergency={emergency} socketState={socketState} locationState={locationState} gpsSync={gpsSync} busy={busy} onNavigate={navigate} onLogout={signOut} onRespond={respond} onSos={sendSOS} onRetryLocation={onRetryLocation} onEnd={endJourney} onRefresh={retryJourney} />
     }
     if (path === '/app/journeys') return <JourneyHistoryPage user={user} journeys={journeys} loading={dashboardLoading} error={dashboardError} onNavigate={navigate} onLogout={signOut} onOpen={openJourney} onRetry={refreshDashboard} />
     if (path === '/app/trusted-contacts') return <TrustedContactsPage user={user} contacts={contacts} loading={dashboardLoading} error={dashboardError} invitation={invitation} onNavigate={navigate} onLogout={signOut} onCreate={addContact} onRemove={deleteContact} onDismissInvitation={() => setInvitation(null)} onRetry={refreshDashboard} />

@@ -60,6 +60,10 @@ class SafetyAlert(models.Model):
 
 
 class SOS(models.Model):
+    class TriggerSource(models.TextChoices):
+        MANUAL = "MANUAL", "Manual"
+        VOICE = "VOICE", "Voice"
+
     journey = models.ForeignKey(Journey, on_delete=models.CASCADE, related_name="sos_events")
     created_at = models.DateTimeField(auto_now_add=True)
     latitude = models.FloatField(null=True, blank=True)
@@ -71,6 +75,7 @@ class SOS(models.Model):
         default=SafetyAlert.DeliveryStatus.NOT_CONFIGURED,
     )
     idempotency_key = models.CharField(max_length=64, blank=True, default="")
+    trigger_source = models.CharField(max_length=8, choices=TriggerSource.choices, default=TriggerSource.MANUAL)
 
     class Meta:
         constraints = [models.UniqueConstraint(

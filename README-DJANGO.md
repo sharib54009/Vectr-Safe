@@ -22,7 +22,7 @@ python manage.py process_due_checkins
 
 The worker can also be run once with `python manage.py process_due_checkins --once`. Set `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, and `DJANGO_ALLOWED_HOSTS` appropriately outside local development. `CORS_ALLOWED_ORIGINS` and `CSRF_TRUSTED_ORIGINS` accept comma-separated origins; local Vite origins are configured by default. `VITE_API_BASE_URL` optionally sets the frontend API host.
 
-In a third terminal, run the React app from `frontend/` with `npm install` and `npm run dev`. Open the Vite URL printed in that terminal (normally `http://localhost:5173`). Browser geolocation requires permission and a secure context; localhost is permitted by modern browsers. GPS samples are sent no more often than every 15 seconds while a journey is open.
+In a third terminal, run the React app from `frontend/` with `npm install` and `npm run dev`. Open the Vite URL printed in that terminal (normally `http://localhost:5173`). Browser geolocation requires permission and a secure context; localhost is permitted by modern browsers. GPS samples are collected no more often than every 15 seconds while an active journey is open.
 
 ## Accounts and guardian access
 
@@ -60,13 +60,25 @@ The journey setup screen saves the chosen start and destination coordinates, but
 
 The rider experience includes home, journey setup/review, live journey, history, and trusted-contact pages. The guardian experience has its own authorized journey list and detail view. Active rider and guardian journey screens reconnect to Channels with backoff and refresh their authorized REST detail after reconnecting. GPS history responses are bounded to the latest 500 samples; journey summaries do not include raw GPS history.
 
+### Offline GPS synchronization
+
+The existing browser GPS watcher first writes each sample to IndexedDB (`vectrsafe-gps`, `pending-samples`), then uploads through the existing locations endpoint in timestamp order. Samples carry a client-generated UUID; Django enforces uniqueness per journey and returns the existing sample on retry. The queue is removed only after server acknowledgement, so a refresh or browser restart preserves unsent points. Completed journeys stop collecting GPS but can accept queued samples timestamped at or before their end time. Cancelled journeys discard their local queue when opened. GPS data is scoped to the signed-in journey owner.
+
+The live screen reports offline, syncing, synced, and retry states separately from the Channels connection. If REST fails, upload retry uses exponential backoff up to one minute. Offline samples appear on the rider's local map immediately. While offline, the Django risk engine and guardian live updates do not receive new samples; they resume processing after synchronization. Browser GPS collection stops when the browser/app is closed, but saved samples resume syncing when the active journey is reopened. OpenStreetMap tiles are not stored offline and may be blank without cached tiles.
+
+### Voice SOS
+
+Voice SOS is a foreground option on an active journey and starts only after the rider selects **Enable Voice SOS**. The browser must expose Web Speech on-device recognition (`processLocally`) and have its on-device English command model available; cloud speech recognition is not used. The app requests microphone permission only after that explicit action, releases the permission-check stream, keeps no transcript or audio, and stops recognition when disabled, triggered, or when the journey ends. “Confirm SOS” triggers the same authenticated SOS API as the manual button; “SOS” alone asks for a tap confirmation. Unsupported devices fall back to the always-visible manual SOS button.
+
+The backend reuses an open journey incident and its alert when another SOS arrives, even if it carries a different idempotency key. Completed and cancelled journeys reject new SOS requests. If the device is offline, the UI immediately shows a local SOS state and retries the same idempotent request when connectivity returns while the journey page remains open. The GPS queue does not queue or deliver SOS commands, and guardian delivery is never claimed until Django acknowledges the SOS. The pending local SOS state does not survive a page reload. Browser support and on-device language packs vary by platform; browser foreground restrictions mean voice activation is not available when the app is closed or reliably in the background.
+
 ## Existing data
 
 `backend/saferoute.db` has been left in place and was inspected read-only. Django currently uses a separate `django.sqlite3` file. The differing schemas mean legacy records have not been copied or deleted; preserve and back up the legacy file until an explicit data migration is planned.
 
 ## Verification
 
-From `backend/`, run `python manage.py check`, `python manage.py makemigrations --check --dry-run`, and `python manage.py test`. The suite covers owner/guardian authorization, completion, check-in outcomes and expiry, alert snapshots, idempotent SOS, and private WebSocket access. From `frontend/`, `npm run build` verifies the production bundle.
+From `backend/`, run `python manage.py migrate`, `python manage.py check`, `python manage.py makemigrations --check --dry-run`, and `python manage.py test`. The suite covers owner/guardian authorization, GPS validation, idempotent location retries, event-time ordering, completed-journey queue drain, check-in outcomes and expiry, alert snapshots, idempotent SOS, and private WebSocket access. From `frontend/`, `npm run build` verifies the production bundle.
 
 ## Local manual walkthrough
 
@@ -75,9 +87,12 @@ From `backend/`, run `python manage.py check`, `python manage.py makemigrations 
 3. Sign in as that guardian and accept the code.
 4. Sign in as the rider, choose a start location (browser GPS or map), choose a destination on the map, review the summary, and start a journey.
 5. Allow location access to share real GPS updates. Check the live status and location trace. Route guidance is unavailable until a directions service is configured.
-6. Use the check-in response buttons if a check-in appears. The deadline worker must be running to escalate an unanswered check-in.
-7. Trigger SOS from the live journey only when appropriate; confirm it in the second step. Verify the VectrSafe alert in the guardian dashboard. External texts, calls, or emails are not sent.
-8. End the journey and confirm that the end time is saved and GPS updates stop. Review it in Journey History.
-9. Sign in as the guardian and open the authorized journey to inspect its last location, risk, check-ins, incidents, and alert-delivery status.
+6. During an active journey, use browser devtools Network throttling or disconnect the device. Confirm the offline message appears, new GPS points still move the local map, and the waiting count grows. Reconnect and confirm the count drains and the server journey detail includes those points. Refresh while disconnected to confirm the waiting count and map trace are restored from IndexedDB.
+7. If the browser offers on-device speech recognition, select **Enable Voice SOS**, grant microphone permission, and say **SOS** to see the tap-confirmation prompt. Say **Confirm SOS** to trigger the existing flow. Unsupported browsers should retain manual SOS. Check that recognition stops after the SOS or when the journey ends.
+8. With the active journey open, disconnect the network and trigger voice SOS. Confirm the rider sees a local pending state and no guardian-delivered claim. Reconnect while keeping the page open and confirm the same SOS request is retried.
+9. Use the check-in response buttons if a check-in appears. The deadline worker must be running to escalate an unanswered check-in.
+10. Trigger manual SOS from the live journey only when appropriate; verify the same alert appears in the guardian dashboard. Repeating SOS while an incident is open should reuse that incident. External texts, calls, or emails are not sent.
+11. End the journey and confirm that the end time is saved and GPS and voice recognition stop. If samples are still queued, keep the live page open until the queue drains. Review it in Journey History.
+12. Sign in as the guardian and open the authorized journey to inspect its last server-synchronized location, risk, check-ins, incidents, and alert-delivery status.
 
-The current milestone does not include turn-by-turn routing, crowdsourced danger reports, offline GPS upload queues, voice SOS, or an external SMS/email/phone provider. Risk thresholds are explainable software signals, not a substitute for emergency services or validated safety advice.
+The current milestone does not include turn-by-turn routing, crowdsourced danger reports, offline map tiles, voice SOS, or an external SMS/email/phone provider. Offline GPS queueing cannot provide real-time server-side risk analysis or guardian alerts until connectivity returns. Risk thresholds are explainable software signals, not a substitute for emergency services or validated safety advice.

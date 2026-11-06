@@ -12,12 +12,19 @@ export async function request(path, options = {}) {
   const method = (options.method || 'GET').toUpperCase()
   const headers = new Headers(options.headers || {})
   const hasBody = options.body !== undefined
+  const timeoutSignal = () => globalThis.AbortSignal?.timeout?.(12_000)
   if (hasBody && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json')
   if (!['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes(method)) {
-    const csrfResponse = await fetch(`${API_BASE_URL}/api/auth/csrf/`, { credentials: 'include' }).catch(() => {
-      throw new Error(`Can’t connect to VectrSafe at ${API_BASE_URL}. Start the Django server and try again.`)
+    const csrfResponse = await fetch(`${API_BASE_URL}/api/auth/csrf/`, { credentials: 'include', signal: timeoutSignal() }).catch(() => {
+      const problem = new Error('VectrSafe could not prepare a secure request. The location is saved and will retry.')
+      problem.status = 0
+      throw problem
     })
-    if (!csrfResponse.ok) throw new Error('VectrSafe could not prepare a secure request. Try again.')
+    if (!csrfResponse.ok) {
+      const problem = new Error('VectrSafe could not prepare a secure request. Try again.')
+      problem.status = csrfResponse.status
+      throw problem
+    }
     const token = csrfToken()
     if (token) headers.set('X-CSRFToken', token)
   }
@@ -29,9 +36,14 @@ export async function request(path, options = {}) {
       method,
       headers,
       credentials: 'include',
+      signal: options.signal || timeoutSignal(),
     })
-  } catch {
-    throw new Error(`Can’t connect to VectrSafe at ${API_BASE_URL}. Check that the Django server is running.`)
+  } catch (error) {
+    const problem = new Error(error?.name === 'TimeoutError'
+      ? 'VectrSafe did not respond in time. The location is saved and will retry.'
+      : `Can’t connect to VectrSafe at ${API_BASE_URL}. The location is saved and will retry.`)
+    problem.status = 0
+    throw problem
   }
   if (response.status === 204) return null
   const data = await response.json().catch(() => ({}))

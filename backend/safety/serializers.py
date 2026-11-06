@@ -12,7 +12,7 @@ class SafetyCheckInSerializer(serializers.ModelSerializer):
 class SOSSerializer(serializers.ModelSerializer):
     class Meta:
         model = SOS
-        fields = ["id", "created_at", "latitude", "longitude", "message", "delivery_status"]
+        fields = ["id", "created_at", "latitude", "longitude", "message", "delivery_status", "trigger_source"]
 
 
 class SafetyIncidentSerializer(serializers.ModelSerializer):
