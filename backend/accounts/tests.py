@@ -9,6 +9,37 @@ from .models import TrustedContact
 
 
 class AuthenticationTests(TestCase):
+    def test_signup_rejects_missing_fields_weak_password_and_duplicates(self):
+        client = APIClient()
+        missing = client.post(reverse("auth-signup"), {}, format="json")
+        weak_password = client.post(reverse("auth-signup"), {
+            "username": "new-rider", "email": "new@example.com", "password": "short",
+        }, format="json")
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(weak_password.status_code, 400)
+
+        get_user_model().objects.create_user(
+            username="existing-rider", email="existing@example.com", password="Strong-Unique-Password-247!",
+        )
+        duplicate_username = client.post(reverse("auth-signup"), {
+            "username": "existing-rider", "email": "different@example.com", "password": "Strong-Unique-Password-248!",
+        }, format="json")
+        duplicate_email = client.post(reverse("auth-signup"), {
+            "username": "different-rider", "email": "existing@example.com", "password": "Strong-Unique-Password-248!",
+        }, format="json")
+        self.assertEqual(duplicate_username.status_code, 400)
+        self.assertEqual(duplicate_email.status_code, 400)
+        self.assertEqual(get_user_model().objects.count(), 1)
+
+    def test_login_rejects_missing_or_incorrect_credentials(self):
+        client = APIClient()
+        missing = client.post(reverse("auth-login"), {}, format="json")
+        incorrect = client.post(reverse("auth-login"), {
+            "username": "unknown-rider", "password": "incorrect-password",
+        }, format="json")
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(incorrect.status_code, 400)
+
     def test_signup_requires_csrf_and_creates_authenticated_session(self):
         client = Client(enforce_csrf_checks=True)
         csrf_response = client.get(reverse("auth-csrf"))

@@ -334,15 +334,19 @@ class JourneyApiTests(TestCase):
                 if result[0]:
                     layer = get_channel_layer()
                     await layer.group_send(f"journey_{self.journey.id}", {"type": "risk_update", "payload": {"event": "risk_update", "journey_id": self.journey.id}})
-                    event = await communicator.receive_json_from(timeout=1)
+                    risk_event = await communicator.receive_json_from(timeout=1)
+                    await layer.group_send(f"journey_{self.journey.id}", {"type": "journey_status", "payload": {"event": "journey_status", "journey_id": self.journey.id, "status": Journey.Status.CANCELLED}})
+                    status_event = await communicator.receive_json_from(timeout=1)
                     await communicator.disconnect()
-                    return result, event
+                    return result, (risk_event, status_event)
                 return result, None
 
             return async_to_sync(connect)()
 
-        self.assertEqual(connect_for(self.owner)[1]["event"], "risk_update")
-        self.assertEqual(connect_for(self.guardian)[1]["event"], "risk_update")
+        self.assertEqual(connect_for(self.owner)[1][0]["event"], "risk_update")
+        self.assertEqual(connect_for(self.guardian)[1][0]["event"], "risk_update")
+        self.assertEqual(connect_for(self.owner)[1][1]["status"], Journey.Status.CANCELLED)
+        self.assertEqual(connect_for(self.guardian)[1][1]["status"], Journey.Status.CANCELLED)
         self.assertFalse(connect_for(self.other)[0][0])
 
     def test_sos_requires_idempotency_key(self):
@@ -369,6 +373,35 @@ class JourneyApiTests(TestCase):
         }, format="json")
         self.assertEqual(gps.status_code, 409)
         self.assertEqual(LocationSample.objects.filter(journey=self.journey).count(), 0)
+
+    def test_owner_can_cancel_journey_once_and_cancelled_journey_rejects_safety_actions(self):
+        pending = SafetyCheckIn.objects.create(journey=self.journey, deadline=timezone.now() + timedelta(minutes=1))
+        url = reverse("journey-cancel", args=[self.journey.id])
+        cancelled = self.client.post(url, {}, format="json")
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["status"], Journey.Status.CANCELLED)
+        self.assertIsNotNone(cancelled.json()["ended_at"])
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, SafetyCheckIn.Status.CANCELLED)
+        ended_at = cancelled.json()["ended_at"]
+
+        repeated = self.client.post(url, {}, format="json")
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(repeated.json()["ended_at"], ended_at)
+        gps = self.client.post(reverse("journey-locations", args=[self.journey.id]), {
+            "latitude": 16.5, "longitude": 80.64, "timestamp": timezone.now().isoformat(),
+        }, format="json")
+        sos = self.client.post(reverse("journey-sos", args=[self.journey.id]), {}, format="json", HTTP_IDEMPOTENCY_KEY="cancelled-sos")
+        self.assertEqual(gps.status_code, 409)
+        self.assertEqual(sos.status_code, 409)
+        self.assertFalse(SOS.objects.filter(journey=self.journey).exists())
+
+    def test_only_journey_owner_can_cancel(self):
+        self.client.force_authenticate(self.other)
+        response = self.client.post(reverse("journey-cancel", args=[self.journey.id]), {}, format="json")
+        self.assertEqual(response.status_code, 404)
+        self.journey.refresh_from_db()
+        self.assertEqual(self.journey.status, Journey.Status.ACTIVE)
 
     def test_unauthenticated_journey_creation_is_rejected(self):
         self.client.force_authenticate(user=None)

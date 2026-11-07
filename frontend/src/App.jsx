@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { acceptGuardianInvitation, createTrustedContact, getGuardianJourney, listGuardianJourneys, listTrustedContacts, removeTrustedContact, triggerSos } from './api/safety.js'
 import { getCurrentUser, logIn, logOut, signUp } from './api/auth.js'
-import { completeJourney, createJourney, getJourney, listJourneys, respondToCheckIn } from './api/journeys.js'
+import { cancelJourney as cancelJourneyRequest, completeJourney, createJourney, getJourney, listJourneys, respondToCheckIn } from './api/journeys.js'
 import AuthPage from './pages/AuthPage.jsx'
 import HomePage from './pages/HomePage.jsx'
 import StartJourneyPage from './pages/StartJourneyPage.jsx'
@@ -12,7 +12,7 @@ import GuardianDashboardPage from './pages/GuardianDashboardPage.jsx'
 import GuardianJourneyPage from './pages/GuardianJourneyPage.jsx'
 import useJourneySocket from './hooks/useJourneySocket.js'
 import { journeyActive } from './lib/format.js'
-import { getJourneySnapshot, getQueuedLocations, queueLocationSample, removeJourneyLocations, saveJourneySnapshot } from './gps/locationQueue.js'
+import { getJourneySnapshot, getQueuedLocations, queueLocationSample, removeJourneyLocations, removeQueuedLocation, saveJourneySnapshot } from './gps/locationQueue.js'
 import { syncQueuedLocations } from './gps/locationSync.js'
 
 function currentPath() {
@@ -28,8 +28,8 @@ function useNavigation() {
   }, [])
   const navigate = useCallback(nextPath => {
     if (!nextPath.startsWith('/')) return
-    if (window.location.pathname !== nextPath) window.history.pushState({}, '', nextPath)
-    setPath(nextPath)
+    if (`${window.location.pathname}${window.location.search}` !== nextPath) window.history.pushState({}, '', nextPath)
+    setPath(currentPath())
     window.scrollTo({ top: 0, behavior: 'instant' })
   }, [])
   return [path, navigate]
@@ -108,7 +108,7 @@ function App() {
   const [locationSharing, setLocationSharing] = useState(false)
   const [locationState, setLocationState] = useState('inactive')
   const [gpsSync, setGpsSync] = useState({ state: navigator.onLine ? 'live' : 'offline', queued: 0 })
-  const [busy, setBusy] = useState({ respond: false, sos: false, end: false })
+  const [busy, setBusy] = useState({ respond: false, sos: false, end: false, cancel: false })
   const lastSentAt = useRef(0)
   const pendingSosKey = useRef(null)
   const emergencyRef = useRef(null)
@@ -214,14 +214,48 @@ function App() {
   }, [])
 
   useEffect(() => {
-    getCurrentUser().then(account => {
-      setUser(account)
-      if (path === '/' || path === '/login' || path === '/register') navigate('/app/home')
-    }).catch(problem => {
-      if (!isSessionProblem(problem)) setAuthError(problem.message)
-      setUser(null)
-    }).finally(() => setAuthReady(true))
-  }, []) // The session is checked once when the app starts.
+    let current = true
+    let requestPending = false
+    let retryAfterPending = false
+    let networkFailure = false
+    const checkSession = async () => {
+      if (!current) return
+      if (requestPending) {
+        retryAfterPending = true
+        return
+      }
+      requestPending = true
+      try {
+        const account = await getCurrentUser()
+        if (!current) return
+        networkFailure = false
+        setAuthError('')
+        setUser(account)
+        if (path === '/' || path === '/login' || path === '/register') navigate('/app/home')
+      } catch (problem) {
+        if (!current) return
+        networkFailure = problem.status === 0
+        if (!isSessionProblem(problem)) setAuthError(problem.message)
+        setUser(null)
+      } finally {
+        requestPending = false
+        if (current) setAuthReady(true)
+        const shouldRetry = current && retryAfterPending && networkFailure && navigator.onLine
+        retryAfterPending = false
+        if (shouldRetry) checkSession()
+      }
+    }
+    const onOnline = () => {
+      if (networkFailure) checkSession()
+      else if (requestPending) retryAfterPending = true
+    }
+    window.addEventListener('online', onOnline)
+    checkSession()
+    return () => {
+      current = false
+      window.removeEventListener('online', onOnline)
+    }
+  }, []) // Retry an offline session check when connectivity returns.
 
   useEffect(() => {
     if (user) refreshDashboard()
@@ -387,7 +421,9 @@ function App() {
       return undefined
     }
     setLocationState('requesting')
+    let tracking = true
     const watchId = navigator.geolocation.watchPosition(position => {
+      if (!tracking) return
       setLocationState('active')
       const now = Date.now()
       if (now - lastSentAt.current < 15000) return
@@ -407,10 +443,19 @@ function App() {
       const localLocation = { ...sample, id: `local-${sample.client_sample_id}` }
       setMonitor(previous => appendLocation(previous, localLocation))
       queueLocationSample(sample).then(async () => {
+        if (!tracking) {
+          await removeQueuedLocation(sample.client_sample_id)
+          return
+        }
         const queued = await getQueuedLocations(monitoredJourneyId)
+        if (!tracking) {
+          await removeQueuedLocation(sample.client_sample_id)
+          return
+        }
         setGpsSync(previous => ({ ...previous, queued: queued.length, state: navigator.onLine ? 'syncing' : 'offline' }))
         syncJourneyLocations(monitoredJourneyId)
       }).catch(() => {
+        if (!tracking) return
         setGpsSync(previous => ({ ...previous, state: 'problem' }))
         setJourneyError('Location could not be saved on this device. Check browser storage access.')
       })
@@ -418,14 +463,19 @@ function App() {
       setLocationState(problem.code === 1 ? 'denied' : 'error')
       setLocationSharing(false)
     }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 })
-    return () => navigator.geolocation.clearWatch(watchId)
+    return () => {
+      tracking = false
+      navigator.geolocation.clearWatch(watchId)
+    }
   }, [locationSharing, journey?.id, journey?.status, riderJourneyId, syncJourneyLocations])
 
   const submitAuth = async (mode, credentials) => {
     const account = mode === 'register' ? await signUp(credentials) : await logIn(credentials)
     setUser(account)
     setAuthError('')
-    navigate('/app/home')
+    const requestedNext = new URLSearchParams(window.location.search).get('next')
+    const nextPath = requestedNext?.startsWith('/') ? requestedNext : window.location.pathname.startsWith('/guardian') ? `${window.location.pathname}${window.location.search}` : '/app/home'
+    navigate(nextPath)
   }
 
   const retryAuth = async () => {
@@ -565,6 +615,23 @@ function App() {
     } finally { setBusy(previous => ({ ...previous, end: false })) }
   }
 
+  const cancelJourney = async () => {
+    if (!journey) return
+    setBusy(previous => ({ ...previous, cancel: true }))
+    try {
+      const cancelled = await cancelJourneyRequest(journey.id)
+      setJourney(cancelled)
+      setMonitor(previous => previous ? { ...previous, status: 'CANCELLED' } : previous)
+      setCheckIn(null)
+      setLocationSharing(false)
+      setLocationState('inactive')
+      setJourneys(previous => previous.map(item => item.id === cancelled.id ? cancelled : item))
+      setPageNotice('Journey cancelled. GPS tracking and Voice SOS have stopped.')
+    } catch (problem) {
+      if (!handleSessionProblem(problem)) setJourneyError(problem.message)
+    } finally { setBusy(previous => ({ ...previous, cancel: false })) }
+  }
+
   const signOut = async () => {
     try { await logOut() } catch { /* Clear local data if the server session has already ended. */ }
     clearLocalSession()
@@ -594,13 +661,19 @@ function App() {
 
   const page = (() => {
     if (!authReady) return <main className="grid min-h-screen place-items-center bg-[#f4f6f5] text-slate-700" role="status">Loading VectrSafe…</main>
-    if (!user) return <AuthPage key={path.startsWith('/register') ? 'register' : 'login'} initialMode={path === '/register' ? 'register' : 'login'} onModeChange={mode => navigate(mode === 'register' ? '/register' : '/login')} onSubmit={submitAuth} connectionError={authError} onRetry={retryAuth} />
+    if (!user) return <AuthPage key={path.startsWith('/register') ? 'register' : 'login'} initialMode={path.startsWith('/register') ? 'register' : 'login'} onModeChange={mode => {
+      const destination = mode === 'register' ? '/register' : '/login'
+      const returnTarget = window.location.pathname.startsWith('/guardian')
+        ? `${window.location.pathname}${window.location.search}`
+        : new URLSearchParams(window.location.search).get('next')
+      navigate(returnTarget ? `${destination}?next=${encodeURIComponent(returnTarget)}` : destination)
+    }} onSubmit={submitAuth} connectionError={authError} onRetry={retryAuth} />
     if (path === '/login' || path === '/register' || path === '/') return null
     if (path === '/app/journey/new') return <StartJourneyPage user={user} contacts={contacts} onNavigate={navigate} onLogout={signOut} onStart={startJourney} />
     if (riderJourneyId) {
       if (journeyLoading && !journey) return <main className="grid min-h-[70vh] place-items-center text-slate-700" role="status">Loading journey…</main>
       if (!journey) return <main className="mx-auto mt-12 max-w-xl rounded-2xl border bg-white p-6"><h1 className="text-xl font-black">Journey unavailable</h1><p className="mt-2 text-sm text-slate-600">This journey could not be found or is not available to your account.</p><button onClick={() => navigate('/app/home')} className="mt-4 font-bold text-teal-900 underline">Return home</button></main>
-      return <LiveJourneyPage user={user} journey={{ ...journey, error: journeyError }} monitor={monitor || normalizeJourney(journey)} checkIn={checkIn} alert={alert} emergency={emergency} socketState={socketState} locationState={locationState} gpsSync={gpsSync} busy={busy} onNavigate={navigate} onLogout={signOut} onRespond={respond} onSos={sendSOS} onRetryLocation={onRetryLocation} onEnd={endJourney} onRefresh={retryJourney} />
+      return <LiveJourneyPage user={user} journey={{ ...journey, error: journeyError }} monitor={monitor || normalizeJourney(journey)} checkIn={checkIn} alert={alert} emergency={emergency} socketState={socketState} locationState={locationState} gpsSync={gpsSync} busy={busy} onNavigate={navigate} onLogout={signOut} onRespond={respond} onSos={sendSOS} onRetryLocation={onRetryLocation} onEnd={endJourney} onCancel={cancelJourney} onRefresh={retryJourney} />
     }
     if (path === '/app/journeys') return <JourneyHistoryPage user={user} journeys={journeys} loading={dashboardLoading} error={dashboardError} onNavigate={navigate} onLogout={signOut} onOpen={openJourney} onRetry={refreshDashboard} />
     if (path === '/app/trusted-contacts') return <TrustedContactsPage user={user} contacts={contacts} loading={dashboardLoading} error={dashboardError} invitation={invitation} onNavigate={navigate} onLogout={signOut} onCreate={addContact} onRemove={deleteContact} onDismissInvitation={() => setInvitation(null)} onRetry={refreshDashboard} />

@@ -25,7 +25,7 @@ class JourneyConsumer(AsyncJsonWebsocketConsumer):
             return
         self.group_name = f"journey_{self.scope['url_route']['kwargs']['journey_id']}"
         await self.channel_layer.group_add(self.group_name, self.channel_name)
-        self.last_alert_id, self.checkin_statuses, pending = await self.load_initial_safety_state(
+        self.last_alert_id, self.checkin_statuses, self.current_journey_status, pending = await self.load_initial_safety_state(
             self.scope["url_route"]["kwargs"]["journey_id"]
         )
         await self.accept()
@@ -62,7 +62,8 @@ class JourneyConsumer(AsyncJsonWebsocketConsumer):
                 for alert in alerts:
                     self.last_alert_id = max(self.last_alert_id, alert["id"])
                     await self.send_json({"event": "safety_alert", **alert})
-                if journey_status is not None and alerts:
+                if journey_status is not None and journey_status != self.current_journey_status:
+                    self.current_journey_status = journey_status
                     await self.send_json({"event": "journey_status", "journey_id": journey_id, "status": journey_status})
                 for checkin in checkins:
                     previous_status = self.checkin_statuses.get(checkin["id"])
@@ -93,11 +94,12 @@ class JourneyConsumer(AsyncJsonWebsocketConsumer):
     @database_sync_to_async
     def load_initial_safety_state(self, journey_id):
         last_alert_id = SafetyAlert.objects.filter(journey_id=journey_id).aggregate(max_id=Max("id"))["max_id"] or 0
+        journey_status = Journey.objects.filter(pk=journey_id).values_list("status", flat=True).first()
         checkins = list(SafetyCheckIn.objects.filter(journey_id=journey_id).order_by("-created_at")[:100])
         statuses = {checkin.id: checkin.status for checkin in checkins}
         pending = next((checkin for checkin in checkins if checkin.status == SafetyCheckIn.Status.PENDING), None)
         pending_data = None if pending is None else SafetyCheckInSerializer(pending).data
-        return last_alert_id, statuses, pending_data
+        return last_alert_id, statuses, journey_status, pending_data
 
     @database_sync_to_async
     def load_new_safety_events(self, journey_id, after_alert_id):

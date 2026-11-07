@@ -18,7 +18,7 @@ function normalizePhrase(value) {
 export default function VoiceSOSControl({ activeJourney, emergencyActive, busy, onActivate }) {
   const supported = supportsPrivateRecognition()
   const [state, setState] = useState('DISABLED')
-  const [message, setMessage] = useState('Voice SOS availability depends on browser permissions and device capabilities.')
+  const [message, setMessage] = useState('Microphone permission is required. Voice SOS only listens after you enable it; speech stays on-device and audio is not recorded.')
   const recognitionRef = useRef(null)
   const enabledRef = useRef(false)
   const triggeredRef = useRef(false)
@@ -39,7 +39,10 @@ export default function VoiceSOSControl({ activeJourney, emergencyActive, busy, 
       recognition.onresult = null
       recognition.onerror = null
       recognition.onend = null
-      try { recognition.stop() } catch { /* It may already have stopped. */ }
+      try {
+        if (typeof recognition.abort === 'function') recognition.abort()
+        else recognition.stop()
+      } catch { /* It may already have stopped. */ }
     }
   }, [])
 
@@ -87,7 +90,7 @@ export default function VoiceSOSControl({ activeJourney, emergencyActive, busy, 
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           stopRecognition()
           setState('PERMISSION_DENIED')
-          setMessage('Microphone permission is required to use Voice SOS. Allow it in browser settings, then reload this journey.')
+          setMessage('Microphone permission is required for Voice SOS. Manual SOS is still available. Allow it in browser settings, then reload this journey to try again.')
         } else if (event.error === 'audio-capture') {
           stopRecognition()
           setState('ERROR')
@@ -164,7 +167,7 @@ export default function VoiceSOSControl({ activeJourney, emergencyActive, busy, 
     } catch (error) {
       if (error?.name === 'NotAllowedError' || error?.name === 'PermissionDeniedError') {
         setState('PERMISSION_DENIED')
-        setMessage('Microphone permission is required to use Voice SOS. Allow it in browser settings, then reload this journey.')
+        setMessage('Microphone permission is required for Voice SOS. Manual SOS is still available. Allow it in browser settings, then reload this journey to try again.')
       } else {
         setState('ERROR')
         setMessage('A microphone could not be opened on this device. You can still use the SOS button.')

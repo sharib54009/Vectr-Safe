@@ -26,7 +26,7 @@ function GuardianJourneyRow({ journey, onOpen }) {
 }
 
 export default function GuardianDashboardPage({ user, journeys, loading, error, onNavigate, onLogout, onOpen, onAccept, onRetry }) {
-  const [code, setCode] = useState('')
+  const [code, setCode] = useState(() => new URLSearchParams(window.location.search).get('invitation_code') || '')
   const [formError, setFormError] = useState('')
   const [busy, setBusy] = useState(false)
   const activeCount = journeys.filter(journey => journeyActive(journey.status)).length
@@ -34,7 +34,11 @@ export default function GuardianDashboardPage({ user, journeys, loading, error, 
     event.preventDefault()
     setBusy(true)
     setFormError('')
-    try { await onAccept(code); setCode('') } catch (problem) { setFormError(problem.message) } finally { setBusy(false) }
+    try {
+      await onAccept(code.trim())
+      setCode('')
+      window.history.replaceState({}, '', `${window.location.pathname}`)
+    } catch (problem) { setFormError(problem.message) } finally { setBusy(false) }
   }
   return <AppShell user={user} active="/guardian/journeys" guardian onNavigate={onNavigate} onLogout={onLogout}>
     <main className="mx-auto max-w-5xl space-y-6 px-4 py-6 sm:px-6 sm:py-8">

@@ -5,6 +5,7 @@ export const createJourney = data => post('/api/journeys/', data)
 export const getJourney = journeyId => request(`/api/journeys/${journeyId}/`)
 export const submitLocation = (journeyId, location) => post(`/api/journeys/${journeyId}/locations/`, location)
 export const completeJourney = journeyId => post(`/api/journeys/${journeyId}/complete/`, {})
+export const cancelJourney = journeyId => post(`/api/journeys/${journeyId}/cancel/`, {})
 export const listCheckIns = journeyId => request(`/api/journeys/${journeyId}/check-ins/`)
 export const respondToCheckIn = (journeyId, response) => post(`/api/journeys/${journeyId}/check-in/respond/`, { response })
 

@@ -270,6 +270,31 @@ class JourneyCompleteView(APIView):
         return Response(JourneySerializer(journey).data)
 
 
+class JourneyCancelView(APIView):
+    def post(self, request, journey_id):
+        with transaction.atomic():
+            journey = get_object_or_404(
+                Journey.objects.select_for_update().filter(user=request.user), pk=journey_id,
+            )
+            if journey.status == Journey.Status.COMPLETED:
+                return Response({"detail": "A completed journey cannot be cancelled."}, status=status.HTTP_409_CONFLICT)
+            if journey.status != Journey.Status.CANCELLED:
+                now = timezone.now()
+                journey.status = Journey.Status.CANCELLED
+                journey.ended_at = now
+                journey.save(update_fields=["status", "ended_at"])
+                SafetyCheckIn.objects.filter(
+                    journey=journey,
+                    status=SafetyCheckIn.Status.PENDING,
+                ).update(status=SafetyCheckIn.Status.CANCELLED, updated_at=now)
+                transaction.on_commit(lambda: publish_journey_event(journey.id, "journey_status", {
+                    "journey_id": journey.id,
+                    "status": journey.status,
+                    "ended_at": journey.ended_at.isoformat(),
+                }))
+        return Response(JourneySerializer(journey).data)
+
+
 class JourneyCheckInListView(APIView):
     def get(self, request, journey_id):
         journey = owner_journey_or_404(request, journey_id)

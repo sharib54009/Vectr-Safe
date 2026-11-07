@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import AppShell from '../components/AppShell.jsx'
 import Map from '../components/Map.jsx'
 
@@ -25,6 +25,7 @@ export default function StartJourneyPage({ user, contacts, onNavigate, onLogout,
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [reviewing, setReviewing] = useState(false)
+  const mapSection = useRef(null)
   const acceptedContacts = contacts.filter(contact => contact.accepted_at && contact.is_active !== false)
   const center = originLocation ? [originLocation.latitude, originLocation.longitude] : destinationLocation ? [destinationLocation.latitude, destinationLocation.longitude] : fallbackCenter
   const zoom = originLocation || destinationLocation ? 13 : 2
@@ -35,7 +36,7 @@ export default function StartJourneyPage({ user, contacts, onNavigate, onLogout,
     try {
       const location = await getCurrentLocation()
       setOriginLocation(location)
-      setForm(previous => ({ ...previous, origin: previous.origin || 'Current location' }))
+      setForm(previous => ({ ...previous, origin: `Current location (${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)})` }))
       setLocationState('active')
       setSelectionMode('destination')
     } catch (problem) {
@@ -47,19 +48,27 @@ export default function StartJourneyPage({ user, contacts, onNavigate, onLogout,
   const selectOnMap = location => {
     if (selectionMode === 'origin') {
       setOriginLocation(location)
-      setForm(previous => ({ ...previous, origin: previous.origin || 'Selected on map' }))
+      setForm(previous => ({ ...previous, origin: previous.origin || `Map point (${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)})` }))
       setSelectionMode('')
       setLocationState('selected')
     } else if (selectionMode === 'destination') {
       setDestinationLocation(location)
+      setForm(previous => ({ ...previous, destination: previous.destination || `Map point (${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)})` }))
       setSelectionMode('')
     }
+  }
+
+  const beginMapSelection = mode => {
+    setSelectionMode(mode)
+    setError('')
+    setReviewing(false)
+    requestAnimationFrame(() => mapSection.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
   }
 
   const start = async event => {
     event.preventDefault()
     if (!form.origin.trim() || !form.destination.trim() || !originLocation || !destinationLocation) {
-      setError('Add a start point and destination on the map before continuing.')
+      setError('Select both map points before continuing. Type a place name, then choose its exact point on the map.')
       setReviewing(false)
       return
     }
@@ -87,12 +96,12 @@ export default function StartJourneyPage({ user, contacts, onNavigate, onLogout,
       <div className="grid items-start gap-6 lg:grid-cols-[.8fr_1.2fr]">
         <form onSubmit={start} className="space-y-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
           <section className="space-y-3" aria-labelledby="journey-details-title"><h2 id="journey-details-title" className="font-black">Journey details</h2>
-            <label className="block text-sm font-bold">From<input required value={form.origin} onChange={event => setForm(previous => ({ ...previous, origin: event.target.value }))} className={inputClass} placeholder="Current location or place name" /></label>
-            <div className="flex flex-wrap gap-2"><button type="button" onClick={useLocation} disabled={locationState === 'requesting'} className="min-h-10 rounded-lg border border-teal-700 px-3 text-sm font-bold text-teal-900 disabled:opacity-60">{locationState === 'requesting' ? 'Finding you…' : 'Use my current location'}</button><button type="button" onClick={() => { setSelectionMode('origin'); setError('') }} className="min-h-10 rounded-lg border px-3 text-sm font-semibold">Choose on map</button></div>
-            <p className="text-xs text-slate-600" role="status">{originLocation ? 'Start point selected.' : 'Location access required. You can use GPS or select a point on the map.'}</p>
-            <label className="block text-sm font-bold">To<input required value={form.destination} onChange={event => setForm(previous => ({ ...previous, destination: event.target.value }))} className={inputClass} placeholder="Destination name" /></label>
-            <button type="button" onClick={() => { setSelectionMode('destination'); setError('') }} className="min-h-10 rounded-lg border border-teal-700 px-3 text-sm font-bold text-teal-900">Choose destination on map</button>
-            {destinationLocation && <p className="text-xs font-semibold text-teal-900" role="status">Destination point selected on map.</p>}
+            <label className="block text-sm font-bold">From<input required value={form.origin} onChange={event => { setOriginLocation(null); setForm(previous => ({ ...previous, origin: event.target.value })) }} className={inputClass} placeholder="Current location or place name" /></label>
+            <div className="flex flex-wrap gap-2"><button type="button" onClick={useLocation} disabled={locationState === 'requesting'} className="min-h-10 rounded-lg border border-teal-700 px-3 text-sm font-bold text-teal-900 disabled:opacity-60">{locationState === 'requesting' ? 'Finding you…' : 'Use my current location'}</button><button type="button" onClick={() => beginMapSelection('origin')} className="min-h-10 rounded-lg border px-3 text-sm font-semibold">Choose on map</button></div>
+            <p className="text-xs text-slate-600" role="status">{originLocation ? `Start point selected at ${originLocation.latitude.toFixed(5)}, ${originLocation.longitude.toFixed(5)}.` : selectionMode === 'origin' ? 'Map selection is on. Tap the map to set your start point.' : 'Use GPS or choose a point on the map. Selecting a point also fills in its coordinates.'}</p>
+            <label className="block text-sm font-bold">To<input required value={form.destination} onChange={event => { setDestinationLocation(null); setForm(previous => ({ ...previous, destination: event.target.value })) }} className={inputClass} placeholder="Destination name" /></label>
+            <button type="button" onClick={() => beginMapSelection('destination')} className="min-h-10 rounded-lg border border-teal-700 px-3 text-sm font-bold text-teal-900">Choose destination on map</button>
+            {destinationLocation && <p className="text-xs font-semibold text-teal-900" role="status">Destination point selected: {destinationLocation.latitude.toFixed(5)}, {destinationLocation.longitude.toFixed(5)}.</p>}
             <label className="block text-sm font-bold">Expected arrival <span className="font-normal text-slate-500">(optional)</span><input type="datetime-local" value={form.expected_arrival_at} onChange={event => setForm(previous => ({ ...previous, expected_arrival_at: event.target.value }))} className={inputClass} /></label>
           </section>
           <section className="rounded-xl bg-slate-50 p-4"><h2 className="text-sm font-black">Trusted contact access</h2><p className="mt-1 text-sm text-slate-700">{acceptedContacts.length ? `${acceptedContacts.length} authorized contact${acceptedContacts.length === 1 ? '' : 's'} can view this journey.` : 'No contacts have accepted an invitation yet.'}</p><p className="mt-2 text-xs text-slate-500">All active accepted contacts can view journeys; individual journey selection is not available yet.</p></section>
@@ -102,8 +111,9 @@ export default function StartJourneyPage({ user, contacts, onNavigate, onLogout,
           <div className="flex flex-col gap-2 sm:flex-row">{reviewing && <button type="button" onClick={() => setReviewing(false)} className="min-h-12 flex-1 rounded-xl border px-4 py-3 font-bold">Edit</button>}<button disabled={busy || locationState === 'requesting'} className="min-h-12 flex-1 rounded-xl bg-teal-800 px-4 py-3 font-black text-white hover:bg-teal-900 disabled:opacity-60">{busy ? 'Starting journey…' : reviewing ? 'Start journey' : 'Review journey'}</button></div>
         </form>
         <section className="space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="font-black">Select locations</h2><span className="text-xs text-slate-600">{selectionMode ? `Tap the map to set ${selectionMode === 'origin' ? 'start' : 'destination'}` : 'Map selection'}</span></div>
+          <div ref={mapSection} className={`rounded-2xl p-2 ${selectionMode ? 'bg-teal-50 ring-2 ring-teal-700' : ''}`}><div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-black">Select locations</h2><span role="status" aria-live="polite" className="text-sm font-bold text-teal-900">{selectionMode ? `Tap anywhere on the map to set the ${selectionMode === 'origin' ? 'start' : 'destination'} point` : 'Map selection'}</span>{selectionMode && <button type="button" onClick={() => setSelectionMode('')} className="min-h-9 rounded-lg border border-slate-400 bg-white px-3 text-sm font-semibold">Cancel selection</button>}</div>
           <Map center={center} origin={originLocation} destination={destinationLocation ? { name: form.destination || 'Destination', position: [destinationLocation.latitude, destinationLocation.longitude] } : null} zoom={zoom} className="h-[320px] w-full rounded-2xl border border-slate-200 sm:h-[460px]" onMapClick={selectionMode ? selectOnMap : undefined} />
+          </div>
           <p className="text-xs text-slate-500">Map tiles © OpenStreetMap contributors. Approximate place selection only; this is not turn-by-turn navigation.</p>
         </section>
       </div>
