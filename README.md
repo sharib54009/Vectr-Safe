@@ -29,7 +29,7 @@ npm install
 npm run dev
 ```
 
-The API defaults to port 8001. Set `VITE_API_BASE_URL` when the frontend and backend use different hosts. See [README-DJANGO.md](README-DJANGO.md) for the API, safety flow, configuration, and verification details.
+The frontend reads `VITE_API_URL` from `frontend/.env` for local development (`http://localhost:8001`) and `frontend/.env.production` for production (`https://vectr-safe.onrender.com`). Set `VITE_API_URL` in the frontend deployment environment to override the production API host. The journey WebSocket URL is derived from this value. See [README-DJANGO.md](README-DJANGO.md) for the API, safety flow, configuration, and verification details.
 
 ## Existing data
 

@@ -20,7 +20,7 @@ Run the deadline worker in a second backend terminal. It must stay running to es
 python manage.py process_due_checkins
 ```
 
-The worker can also be run once with `python manage.py process_due_checkins --once`. Set `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, and `DJANGO_ALLOWED_HOSTS` appropriately outside local development. `CORS_ALLOWED_ORIGINS` and `CSRF_TRUSTED_ORIGINS` accept comma-separated origins; local Vite origins are configured by default. `VITE_API_BASE_URL` optionally sets the frontend API host.
+The worker can also be run once with `python manage.py process_due_checkins --once`. Set `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, and `DJANGO_ALLOWED_HOSTS` appropriately outside local development. `CORS_ALLOWED_ORIGINS` and `CSRF_TRUSTED_ORIGINS` accept comma-separated origins; local Vite origins are configured by default. The frontend API host is configured with `VITE_API_URL` in `frontend/.env` for local development and `frontend/.env.production` for production.
 
 In a third terminal, run the React app from `frontend/` with `npm install` and `npm run dev`. Open the Vite URL printed in that terminal (normally `http://localhost:5173`). Browser geolocation requires permission and a secure context; localhost is permitted by modern browsers. GPS samples are collected no more often than every 15 seconds while an active journey is open.
 

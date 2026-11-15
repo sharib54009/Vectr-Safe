@@ -12,6 +12,8 @@ backend/*.py[cod]
 .env
 .env.*
 !*.example
+!frontend/.env
+!frontend/.env.production
 backend/*.db
 backend/*.sqlite3
 

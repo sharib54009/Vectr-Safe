@@ -1,7 +1,8 @@
-const defaultApiHost = `${window.location.protocol}//${window.location.hostname}:8001`
+const configuredApiUrl = import.meta.env.VITE_API_URL
+if (!configuredApiUrl) throw new Error('VITE_API_URL must be configured for this build.')
 
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || defaultApiHost).replace(/\/$/, '')
-export const WS_BASE_URL = (import.meta.env.VITE_WS_BASE_URL || API_BASE_URL.replace(/^http/, 'ws')).replace(/\/$/, '')
+export const API_BASE_URL = configuredApiUrl.replace(/\/$/, '')
+export const WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws')
 
 function csrfToken() {
   const cookie = document.cookie.split('; ').find(part => part.startsWith('csrftoken='))
